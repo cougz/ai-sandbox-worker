@@ -14,14 +14,25 @@
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["SandboxAgent"] }],
 
-  // Public base URL — used by get_report_url to build shareable /view links.
-  // Update this after deploying if you use a custom domain.
+  // KV namespace for user registry (clientId → email, email → user record)
+  // Create with: wrangler kv namespace create USER_REGISTRY
+  "kv_namespaces": [
+    { "binding": "USER_REGISTRY", "id": "REPLACE_WITH_KV_NAMESPACE_ID" }
+  ],
+
   "vars": {
-    "PUBLIC_URL": "https://ai-sandbox.cloudemo.org"
+    // Public base URL for shareable /view links
+    "PUBLIC_URL": "https://ai-sandbox.cloudemo.org",
+
+    // Fallback user identity for local wrangler dev (never used in production)
+    "DEV_USER_ID": "dev@cloudflare.com"
   },
 
+  // Secrets (set after deploy):
+  //   wrangler secret put ADMIN_SECRET
+  //   → used to authenticate /admin requests
+
   // R2 for large file spill-over from the sandbox filesystem
-  // Remove this block if you don't need persistent large file storage
   "r2_buckets": [
     {
       "binding": "STORAGE",

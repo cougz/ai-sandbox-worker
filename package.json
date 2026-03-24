@@ -1,0 +1,23 @@
+{
+  "name": "ai-sandbox-worker",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "types": "wrangler types"
+  },
+  "dependencies": {
+    "agents": "^0.8.0",
+    "@cloudflare/codemode": "^0.3.0",
+    "@cloudflare/shell": "^0.3.0",
+    "@cloudflare/worker-bundler": "^0.0.4",
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.0.0",
+    "typescript": "^5.5.0",
+    "wrangler": "^4.0.0"
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "ai-sandbox-worker",
+  "main": "src/agent.ts",
+  "compatibility_date": "2026-03-01",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // Dynamic Worker Loader — this is what enables isolated sandboxes
+  "worker_loaders": [{ "binding": "LOADER" }],
+
+  // McpAgent is a Durable Object — one instance per session, with SQLite storage
+  "durable_objects": {
+    "bindings": [{ "name": "SandboxAgent", "class_name": "SandboxAgent" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["SandboxAgent"] }],
+
+  // R2 for large file spill-over from the sandbox filesystem
+  // Remove this block if you don't need persistent large file storage
+  "r2_buckets": [
+    {
+      "binding": "STORAGE",
+      "bucket_name": "sandbox-storage"
+    }
+  ]
+}

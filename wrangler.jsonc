@@ -23,7 +23,7 @@
   // D1 for persistent user workspaces (files survive across sessions)
   // Create with: wrangler d1 create sandbox-workspaces
   "d1_databases": [
-    { "binding": "WORKSPACE_DB", "database_name": "sandbox-workspaces", "database_id": "REPLACE_WITH_D1_ID" }
+    { "binding": "WORKSPACE_DB", "database_name": "ai-sandbox", "database_id": "f74dc209-da5f-432f-98c8-6c579c488b7f" }
   ],
 
   "vars": {

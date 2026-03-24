@@ -12,11 +12,12 @@
   },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["SandboxAgent"] }],
 
-  // KV for the OAuth provider (tokens, client registrations, state)
-  // Create with: wrangler kv namespace create OAUTH_KV
+  // OAUTH_KV and USER_REGISTRY share the same namespace — key prefixes don't collide
+  // (oauth:* for OAuth state, user:* for admin registry)
+  // To use separate namespaces: wrangler kv namespace create OAUTH_KV
   "kv_namespaces": [
-    { "binding": "OAUTH_KV",       "id": "REPLACE_WITH_OAUTH_KV_ID"       },
-    { "binding": "USER_REGISTRY",  "id": "670e81fe1d294d50bbf1d1c6e5b9ded3" }
+    { "binding": "OAUTH_KV",      "id": "670e81fe1d294d50bbf1d1c6e5b9ded3" },
+    { "binding": "USER_REGISTRY", "id": "670e81fe1d294d50bbf1d1c6e5b9ded3" }
   ],
 
   // D1 for persistent user workspaces (files survive across sessions)

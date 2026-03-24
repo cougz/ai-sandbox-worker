@@ -17,7 +17,7 @@
   // Public base URL — used by get_report_url to build shareable /view links.
   // Update this after deploying if you use a custom domain.
   "vars": {
-    "PUBLIC_URL": "https://ai-sandbox-worker.timseiffert.workers.dev"
+    "PUBLIC_URL": "https://ai-sandbox.cloudemo.org"
   },
 
   // R2 for large file spill-over from the sandbox filesystem

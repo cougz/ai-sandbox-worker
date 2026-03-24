@@ -283,7 +283,7 @@ User: "Analyse the pipeline data and create a dashboard"
 → get_report_url returns: https://ai-sandbox.cloudemo.org/view?user=tim@cloudflare.com&file=/reports/pipeline-dashboard.html
 ```
 
-Reports use the [Cloudflare Workers Design System](https://cf-workers-design.nireka-96.workers.dev/) — warm cream backgrounds, CF orange accents, corner bracket decorations, Chart.js charts. Design tokens are stored in the sandbox workspace at `/templates/cf-base.css` and `/templates/cf-charts.js`.
+The LLM can use any styling approach — write self-contained HTML with inline CSS and Chart.js, or store reusable design tokens in the workspace (e.g. `/templates/cf-base.css`, `/templates/cf-charts.js`) and read them back with `state.readFile` before composing the final report.
 
 ---
 

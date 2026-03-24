@@ -12,14 +12,6 @@ import { domainTools } from "./tools/example";
 import { handleRequest } from "./access-handler";
 import type { Props } from "./workers-oauth-utils";
 
-const CONTENT_TYPES: Record<string, string> = {
-  html: "text/html; charset=utf-8",
-  json: "application/json; charset=utf-8",
-  md:   "text/markdown; charset=utf-8",
-  txt:  "text/plain; charset=utf-8",
-  csv:  "text/csv; charset=utf-8",
-};
-
 // ─── Env ──────────────────────────────────────────────────────────────────────
 
 export interface Env {
@@ -84,36 +76,18 @@ const domainProvider = { tools: domainTools } as const;
 export class SandboxAgent extends McpAgent<Env, Record<string, never>, Props> {
   server = new McpServer({ name: "ai-sandbox", version: "1.0.0" });
 
-  // D1-backed workspace: keyed by the user's email so files persist across sessions
+  // D1-backed workspace: keyed by the user's email so files persist across sessions.
+  // Cached per DO instance — Workspace registers its namespace once per sql source.
+  private _workspace?: Workspace;
   get workspace(): Workspace {
-    return new Workspace({
-      sql: this.env.WORKSPACE_DB as unknown as SqlStorage,
-      r2: this.env.STORAGE,
-      name: () => this.props?.email ?? "anonymous",
-    });
-  }
-
-  // ── Legacy /view handler ──────────────────────────────────────────────────
-  // Called when old ?session= links route directly to a pre-OAuth DO instance.
-  // Those DOs have their workspace in DO-local SQLite (this.ctx.storage.sql),
-  // not in D1, so we build a Workspace against the DO's own storage here.
-  async onRequest(request: Request): Promise<Response> {
-    const url = new URL(request.url);
-    if (url.pathname === "/view") {
-      const file = url.searchParams.get("file") ?? "/reports/dashboard.html";
-      const legacyWorkspace = new Workspace({
-        sql: this.ctx.storage.sql,
+    if (!this._workspace) {
+      this._workspace = new Workspace({
+        sql: this.env.WORKSPACE_DB as unknown as SqlStorage,
         r2: this.env.STORAGE,
-        name: () => this.name,
-      });
-      const content = await legacyWorkspace.readFile(file);
-      if (content === null) return new Response(`File not found: ${file}`, { status: 404 });
-      const ext = file.split(".").pop()?.toLowerCase() ?? "txt";
-      return new Response(content, {
-        headers: { "Content-Type": CONTENT_TYPES[ext] ?? "text/plain; charset=utf-8" },
+        name: () => this.props?.email ?? "anonymous",
       });
     }
-    return new Response("Not found", { status: 404 });
+    return this._workspace;
   }
 
   async init() {

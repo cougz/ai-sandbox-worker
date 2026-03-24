@@ -151,20 +151,35 @@ export async function handleRequest(
 
   // ── Public: serve a workspace file ───────────────────────────────────────
   if (pathname === "/view") {
-    const email = searchParams.get("user");
-    const file  = searchParams.get("file") ?? "/reports/dashboard.html";
+    const email       = searchParams.get("user");
+    const sessionName = searchParams.get("session"); // legacy links pre-OAuth rewrite
+    const file        = searchParams.get("file") ?? "/reports/dashboard.html";
 
-    if (!email) return new Response("Missing ?user=EMAIL", { status: 400 });
+    if (email) {
+      // Current path — D1-backed workspace, read directly
+      const workspace = makeWorkspace(email, env);
+      const content = await workspace.readFile(file);
+      if (content === null) return new Response(`File not found: ${file}`, { status: 404 });
+      const ext = file.split(".").pop()?.toLowerCase() ?? "txt";
+      return new Response(content, {
+        headers: { "Content-Type": CONTENT_TYPES[ext] ?? "text/plain; charset=utf-8" },
+      });
+    }
 
-    // Workspaces are backed by D1 — we can read them directly without a DO stub
-    const workspace = makeWorkspace(email, env);
-    const content = await workspace.readFile(file);
-    if (content === null) return new Response(`File not found: ${file}`, { status: 404 });
+    if (sessionName) {
+      // Legacy path — old DO-backed workspace (pre-OAuth sessions)
+      // Must add x-partykit-room so the partyserver base class initialises correctly
+      const id   = env.SandboxAgent.idFromName(sessionName);
+      const stub = env.SandboxAgent.get(id);
+      const req  = new Request(request.url, {
+        method:  request.method,
+        headers: new Headers(request.headers),
+      });
+      (req.headers as Headers).set("x-partykit-room", sessionName);
+      return stub.fetch(req);
+    }
 
-    const ext = file.split(".").pop()?.toLowerCase() ?? "txt";
-    return new Response(content, {
-      headers: { "Content-Type": CONTENT_TYPES[ext] ?? "text/plain; charset=utf-8" },
-    });
+    return new Response("Missing query param: ?user=EMAIL or ?session=SESSION", { status: 400 });
   }
 
   // ── Admin dashboard ───────────────────────────────────────────────────────

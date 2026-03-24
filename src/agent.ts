@@ -15,6 +15,8 @@ export interface Env {
   LOADER: WorkerLoader;
   SandboxAgent: DurableObjectNamespace;
   STORAGE?: R2Bucket;
+  // Set in wrangler.jsonc — used to build shareable /view URLs
+  PUBLIC_URL: string;
 }
 
 // ─── Domain tool provider ────────────────────────────────────────────────────
@@ -24,12 +26,6 @@ const domainProvider = {
 } as const;
 
 // ─── GitPrism provider ───────────────────────────────────────────────────────
-// Calls the GitPrism MCP server via the MCP SDK Client.
-// Runs on the HOST (can make outbound HTTP), not inside the sandbox.
-// The sandbox calls gitprism.ingest_repo({ url, detail }) via Workers RPC.
-//
-// We create a fresh Client per call because GitPrism is stateless — there is
-// no persistent session to maintain across Durable Object invocations.
 
 function makeGitprismProvider() {
   return {
@@ -40,11 +36,6 @@ function makeGitprismProvider() {
           "Convert any public GitHub repository into LLM-ready Markdown.",
           "Args: { url: string (GitHub URL or owner/repo shorthand),",
           "        detail?: 'summary' | 'structure' | 'file-list' | 'full' (default: 'full') }",
-          "detail levels:",
-          "  summary    — YAML front-matter: repo name, ref, file count, total size",
-          "  structure  — summary + ASCII directory tree",
-          "  file-list  — structure + table of every file with size and line count",
-          "  full       — everything above + complete file contents",
         ].join("\n"),
         execute: async (args: unknown) => {
           const { url, detail = "full" } = args as { url: string; detail?: string };
@@ -69,6 +60,16 @@ function makeGitprismProvider() {
   };
 }
 
+// ─── Content-type helper ─────────────────────────────────────────────────────
+
+const CONTENT_TYPES: Record<string, string> = {
+  html: "text/html; charset=utf-8",
+  json: "application/json; charset=utf-8",
+  md:   "text/markdown; charset=utf-8",
+  txt:  "text/plain; charset=utf-8",
+  csv:  "text/csv; charset=utf-8",
+};
+
 // ─── SandboxAgent ─────────────────────────────────────────────────────────────
 
 export class SandboxAgent extends McpAgent<Env, Record<string, never>, {}> {
@@ -80,7 +81,33 @@ export class SandboxAgent extends McpAgent<Env, Record<string, never>, {}> {
     name: () => this.name,
   });
 
+  // ── /view handler ──────────────────────────────────────────────────────────
+  // Called by the Worker-level fetch when the request is routed to this DO.
+  // Serves any file from the session's workspace by path.
+  //
+  // URL: https://WORKER/view?session=SESSION_NAME&file=/reports/dashboard.html
+  async onRequest(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+
+    if (url.pathname === "/view") {
+      const file = url.searchParams.get("file") ?? "/reports/dashboard.html";
+      const content = await this.workspace.readFile(file);
+
+      if (content === null) {
+        return new Response(`File not found: ${file}`, { status: 404 });
+      }
+
+      const ext = file.split(".").pop()?.toLowerCase() ?? "txt";
+      const contentType = CONTENT_TYPES[ext] ?? "text/plain; charset=utf-8";
+      return new Response(content, { headers: { "Content-Type": contentType } });
+    }
+
+    return new Response("Not found", { status: 404 });
+  }
+
   async init() {
+    // ── Tool: run_code ────────────────────────────────────────────────────────
+
     this.server.tool(
       "run_code",
       [
@@ -114,15 +141,12 @@ export class SandboxAgent extends McpAgent<Env, Record<string, never>, {}> {
         ]);
 
         return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify({ result, logs: logs ?? [], error: error ?? null }, null, 2),
-            },
-          ],
+          content: [{ type: "text" as const, text: JSON.stringify({ result, logs: logs ?? [], error: error ?? null }, null, 2) }],
         };
       }
     );
+
+    // ── Tool: run_bundled_code ────────────────────────────────────────────────
 
     this.server.tool(
       "run_bundled_code",
@@ -136,25 +160,14 @@ export class SandboxAgent extends McpAgent<Env, Record<string, never>, {}> {
         "state.*, codemode.*, and gitprism.* are available exactly as in run_code.",
       ].join("\n"),
       {
-        code: z.string().describe(
-          "JavaScript to run. Use dynamic import() to load declared packages."
-        ),
-        packages: z
-          .record(z.string())
-          .optional()
-          .describe(
-            "npm packages to install: { packageName: versionRange }. E.g. { lodash: '^4' }"
-          ),
+        code: z.string().describe("JavaScript to run. Use dynamic import() to load declared packages."),
+        packages: z.record(z.string()).optional().describe("npm packages: { name: versionRange }"),
       },
       async ({ code, packages }) => {
         const { modules: bundledModules } = await createWorker({
           files: {
-            "src/entry.ts": Object.keys(packages ?? {})
-              .map((p) => `import "${p}";`)
-              .join("\n") || "export {}",
-            ...(packages
-              ? { "package.json": JSON.stringify({ dependencies: packages }) }
-              : {}),
+            "src/entry.ts": Object.keys(packages ?? {}).map((p) => `import "${p}";`).join("\n") || "export {}",
+            ...(packages ? { "package.json": JSON.stringify({ dependencies: packages }) } : {}),
           },
         });
 
@@ -171,12 +184,34 @@ export class SandboxAgent extends McpAgent<Env, Record<string, never>, {}> {
         ]);
 
         return {
-          content: [
-            {
-              type: "text" as const,
-              text: JSON.stringify({ result, logs: logs ?? [], error: error ?? null }, null, 2),
-            },
-          ],
+          content: [{ type: "text" as const, text: JSON.stringify({ result, logs: logs ?? [], error: error ?? null }, null, 2) }],
+        };
+      }
+    );
+
+    // ── Tool: get_report_url ──────────────────────────────────────────────────
+    // Returns a shareable URL for any file in the session's workspace.
+    // Use this after generating an HTML report to get a link you can open
+    // in a browser or share with stakeholders.
+
+    this.server.tool(
+      "get_report_url",
+      [
+        "Get a shareable browser URL for a file written to the workspace.",
+        "Use this after generating an HTML report with run_code.",
+        "The URL can be opened directly in any browser — no login required.",
+        "",
+        "Example: after writing /reports/dashboard.html, call this tool to get",
+        "a link you can share with stakeholders.",
+      ].join("\n"),
+      {
+        file: z.string().default("/reports/dashboard.html").describe("Workspace path to serve, e.g. /reports/dashboard.html"),
+      },
+      async ({ file }) => {
+        const base = this.env.PUBLIC_URL.replace(/\/$/, "");
+        const url = `${base}/view?session=${encodeURIComponent(this.name)}&file=${encodeURIComponent(file)}`;
+        return {
+          content: [{ type: "text" as const, text: url }],
         };
       }
     );
@@ -184,15 +219,34 @@ export class SandboxAgent extends McpAgent<Env, Record<string, never>, {}> {
 }
 
 // ─── Worker entry point ───────────────────────────────────────────────────────
-// Serves the MCP protocol at /mcp.
+// Wraps McpAgent.serve() to also handle /view requests.
+//
+// /mcp  → MCP protocol (OpenCode connects here)
+// /view → serves workspace files; route: ?session=NAME&file=/path/to/file.html
 //
 // Add to opencode.jsonc:
-//
-//   "mcp": {
-//     "my-sandbox": {
-//       "type": "remote",
-//       "url": "https://YOUR_WORKER.YOUR_SUBDOMAIN.workers.dev/mcp"
-//     }
-//   }
+//   "mcp": { "my-sandbox": { "type": "remote", "url": "https://WORKER.workers.dev/mcp" } }
 
-export default SandboxAgent.serve("/mcp", { binding: "SandboxAgent" });
+const mcpHandler = SandboxAgent.serve("/mcp", { binding: "SandboxAgent" });
+
+export default {
+  ...(mcpHandler as object),
+
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const url = new URL(request.url);
+
+    // Route /view to the correct DO instance (identified by ?session=)
+    if (url.pathname === "/view") {
+      const session = url.searchParams.get("session");
+      if (!session) {
+        return new Response("Missing required query param: ?session=SESSION_NAME", { status: 400 });
+      }
+      const id = env.SandboxAgent.idFromName(session);
+      const stub = env.SandboxAgent.get(id);
+      return stub.fetch(request);
+    }
+
+    // Everything else goes to the MCP handler
+    return (mcpHandler as any).fetch(request, env, ctx);
+  },
+};

@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { McpAgent } from "agents/mcp";
 import { DynamicWorkerExecutor, resolveProvider } from "@cloudflare/codemode";
+import { aiTools } from "@cloudflare/codemode/ai";
 import { Workspace } from "@cloudflare/shell";
 import { stateTools } from "@cloudflare/shell/workers";
 import { createWorker } from "@cloudflare/worker-bundler";
@@ -53,20 +54,33 @@ export class SandboxAgent extends McpAgent<Env, Record<string, never>, {}> {
   });
 
   async init() {
+    // ── Connect to GitPrism MCP server ───────────────────────────────────────
+    // GitPrism converts any public GitHub repo to LLM-ready Markdown.
+    // Connecting here makes its tools available inside the sandbox as gitprism.*
+    //
+    // Auth note: GitPrism uses a server-side GITHUB_TOKEN — no OAuth needed
+    // from our side. The token lives on their Worker; we just call the MCP endpoint.
+    await this.addMcpServer("gitprism", "https://gitprism.cloudemo.org/mcp", {
+      transport: { type: "streamable-http" },
+    });
+
     // ── Tool: run_code ───────────────────────────────────────────────────────
     // The primary tool. Runs a JavaScript snippet in an isolated Dynamic Worker.
     //
-    // Inside the sandbox, two namespaces are available:
+    // Inside the sandbox, three namespaces are available:
     //
     //   state.*     — full filesystem (read/write/search/replace/diff/glob...)
     //                 Backed by this session's persistent Workspace.
-    //                 See: https://www.npmjs.com/package/@cloudflare/shell
     //
     //   codemode.*  — your TypeScript RPC tools (src/tools/example.ts)
     //                 Runs in the HOST worker, not the sandbox.
     //
+    //   gitprism.*  — GitPrism MCP tools, proxied through the host Worker.
+    //                 e.g. gitprism.ingest_repo({ url: "owner/repo", detail: "summary" })
+    //
     // Network access is blocked by default (globalOutbound: null).
-    // To allow controlled outbound calls, pass an env binding as globalOutbound.
+    // MCP tool calls cross the sandbox boundary via Workers RPC — they are NOT
+    // outbound HTTP from inside the sandbox. The host Worker makes those calls.
 
     this.server.tool(
       "run_code",
@@ -74,10 +88,12 @@ export class SandboxAgent extends McpAgent<Env, Record<string, never>, {}> {
         "Execute JavaScript code in an isolated V8 sandbox (~2ms startup, no network).",
         "",
         "Available in sandbox:",
-        "  state.*    — filesystem ops: readFile, writeFile, glob, searchFiles,",
-        "               replaceInFiles, diff, readJson, writeJson, walkTree, ...",
-        "  codemode.* — domain tools: " +
-          Object.keys(domainTools).join(", "),
+        "  state.*     — filesystem ops: readFile, writeFile, glob, searchFiles,",
+        "                replaceInFiles, diff, readJson, writeJson, walkTree, ...",
+        "  codemode.*  — domain tools: " + Object.keys(domainTools).join(", "),
+        "  gitprism.*  — ingest_repo({ url, detail? })",
+        "                Converts a public GitHub repo to Markdown.",
+        "                detail: 'summary' | 'structure' | 'file-list' | 'full'",
         "",
         "Files written via state.* persist across multiple run_code calls in the",
         "same session. Use them to accumulate context or checkpoint work.",
@@ -85,7 +101,7 @@ export class SandboxAgent extends McpAgent<Env, Record<string, never>, {}> {
         "The code must be an async arrow function or a block of statements.",
         "Its return value is JSON-serialized and returned as the tool result.",
       ].join("\n"),
-      { code: z.string().describe("JavaScript to run. Can use state.* and codemode.*") },
+      { code: z.string().describe("JavaScript to run. Can use state.*, codemode.*, and gitprism.*") },
       async ({ code }) => {
         const executor = new DynamicWorkerExecutor({
           loader: this.env.LOADER,
@@ -95,6 +111,10 @@ export class SandboxAgent extends McpAgent<Env, Record<string, never>, {}> {
         const { result, logs, error } = await executor.execute(code, [
           resolveProvider(stateTools(this.workspace)),
           resolveProvider(domainProvider),
+          // GitPrism MCP tools under the "gitprism" namespace.
+          // execute() functions run on the HOST (can make outbound calls),
+          // not inside the sandbox.
+          resolveProvider(aiTools(this.mcp.getTools(), "gitprism")),
         ]);
 
         return {
@@ -177,6 +197,7 @@ export class SandboxAgent extends McpAgent<Env, Record<string, never>, {}> {
         const { result, logs, error } = await executor.execute(code, [
           resolveProvider(stateTools(this.workspace)),
           resolveProvider(domainProvider),
+          resolveProvider(aiTools(this.mcp.getTools(), "gitprism")),
         ]);
 
         return {

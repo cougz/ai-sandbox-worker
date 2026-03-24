@@ -48,17 +48,15 @@ OpenCode / MCP client
 
 ## One-time infrastructure setup
 
-### 1. Create KV namespaces
+### 1. KV namespace
+
+`OAUTH_KV` and `USER_REGISTRY` share the existing KV namespace (`670e81fe1d294d50bbf1d1c6e5b9ded3`). Key prefixes don't collide (`oauth:*` vs `user:*`), so no new namespace is needed.
+
+If starting from scratch:
 
 ```bash
-# OAuth provider state (tokens, client registrations)
-wrangler kv namespace create OAUTH_KV
-# → outputs an ID, paste it into wrangler.jsonc under OAUTH_KV
-
-# Admin user registry (auto-provisioned on first login, used by /admin)
-# Already created (ID: 670e81fe1d294d50bbf1d1c6e5b9ded3)
-# No action needed unless starting fresh:
-# wrangler kv namespace create USER_REGISTRY
+wrangler kv namespace create USER_REGISTRY
+# → outputs an ID; set both OAUTH_KV and USER_REGISTRY to that ID in wrangler.jsonc
 ```
 
 ### 2. Create the D1 workspace database

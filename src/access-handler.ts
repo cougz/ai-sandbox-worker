@@ -575,7 +575,7 @@ function renderSharedFiles(files){
       <span><span class="file-path">\${f.path}</span><span class="file-size">\${fmtSize(f.size??0)}</span></span>
       <div style="display:flex;gap:8px;align-items:center">
         \${isHtml?'<a class="file-link" href="'+viewUrl+'" target="_blank">View ↗</a>':''}
-        <button style="padding:3px 10px;font-size:11px" class="danger" onclick="deleteSharedFile('\${f.path.replace(/'/g,\\"\\'\\")  }')">Delete</button>
+        <button style="padding:3px 10px;font-size:11px" class="danger" onclick="deleteSharedFile(\${JSON.stringify(f.path)})">Delete</button>
       </div>
     </div>\`;
   }).join('')+'</div>';}

@@ -300,6 +300,63 @@ async function handleAdminApi(request: Request, env: Env): Promise<Response> {
   const path   = url.pathname.replace(/^\/admin\/api/, "");
   const method = request.method.toUpperCase();
 
+  // ── Global tools endpoints (shared workspace /tools/*.json) ──────────────────
+  // Global tools auto-load for ALL users at session start (higher priority than personal).
+
+  // GET /global-tools
+  if (method === "GET" && path === "/global-tools") {
+    try {
+      const ws = makeSharedWorkspace(env);
+      const entries = await ws.glob("/tools/*.json") as Array<{ path: string; type: string; size: number }>;
+      const tools = await Promise.all(
+        entries.filter(e => e.type === "file").map(async e => {
+          try {
+            const content = await ws.readFile(e.path);
+            if (!content) return { path: e.path, size: e.size };
+            const def = JSON.parse(content);
+            return { path: e.path, size: e.size, name: def.name, description: def.description };
+          } catch { return { path: e.path, size: e.size }; }
+        })
+      );
+      return jsonResp(tools);
+    } catch (err) { return jsonResp({ error: String(err) }, 500); }
+  }
+
+  // POST /global-tools — upload a tool JSON to shared workspace
+  // Body: { name, description, schema, code }  OR  { path, content } for raw upload
+  if (method === "POST" && path === "/global-tools") {
+    try {
+      const body = await request.json<{ name?: string; description?: string; schema?: unknown; code?: string; path?: string; content?: string }>();
+      let filePath: string;
+      let fileContent: string;
+      if (body.path && body.content !== undefined) {
+        // Raw file upload
+        filePath = body.path;
+        fileContent = body.content;
+      } else if (body.name && body.code) {
+        // Structured tool upload
+        filePath = `/tools/${body.name}.json`;
+        fileContent = JSON.stringify({ name: body.name, description: body.description ?? "", schema: body.schema ?? {}, code: body.code }, null, 2);
+      } else {
+        return jsonResp({ error: "Provide either {name, code} or {path, content}" }, 400);
+      }
+      const ws = makeSharedWorkspace(env);
+      await ws.writeFile(filePath, fileContent);
+      return jsonResp({ uploaded: filePath });
+    } catch (err) { return jsonResp({ error: String(err) }, 500); }
+  }
+
+  // DELETE /global-tools?name=... — remove from shared workspace
+  if (method === "DELETE" && path === "/global-tools") {
+    const name = url.searchParams.get("name");
+    if (!name) return jsonResp({ error: "Missing ?name=" }, 400);
+    try {
+      const ws = makeSharedWorkspace(env);
+      await ws.rm(`/tools/${name}.json`);
+      return jsonResp({ deleted: name });
+    } catch (err) { return jsonResp({ error: String(err) }, 500); }
+  }
+
   // ── Shared workspace endpoints ─────────────────────────────────────────────
 
   // GET /shared/files — list all files in the shared workspace
@@ -416,6 +473,7 @@ function adminDashboard(): Response {
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AI Sandbox — Admin</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 66 30'><path fill='%23FF4801' d='M52.688 13.028c-.22 0-.437.008-.654.015a.3.3 0 0 0-.102.024.37.37 0 0 0-.236.255l-.93 3.249c-.401 1.397-.252 2.687.422 3.634.618.876 1.646 1.39 2.894 1.45l5.045.306a.45.45 0 0 1 .435.41.5.5 0 0 1-.025.223.64.64 0 0 1-.547.426l-5.242.306c-2.848.132-5.912 2.456-6.987 5.29l-.378 1a.28.28 0 0 0 .248.382h18.054a.48.48 0 0 0 .464-.35c.32-1.153.482-2.344.48-3.54 0-7.22-5.79-13.072-12.933-13.072M44.807 29.578l.334-1.175c.402-1.397.253-2.687-.42-3.634-.62-.876-1.647-1.39-2.896-1.45l-23.665-.306a.47.47 0 0 1-.374-.199.5.5 0 0 1-.052-.434.64.64 0 0 1 .552-.426l23.886-.306c2.836-.131 5.9-2.456 6.975-5.29l1.362-3.6a.9.9 0 0 0 .04-.477C48.997 5.259 42.789 0 35.367 0c-6.842 0-12.647 4.462-14.73 10.665a6.92 6.92 0 0 0-4.911-1.374c-3.28.33-5.92 3.002-6.246 6.318a7.2 7.2 0 0 0 .18 2.472C4.3 18.241 0 22.679 0 28.133q0 .74.106 1.453a.46.46 0 0 0 .457.402h43.704a.57.57 0 0 0 .54-.418'/></svg>">
 <style>
 html{color-scheme:light}*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{--cf-orange:#FF4801;--cf-text:#521000;--cf-text-muted:rgba(82,16,0,0.7);--cf-text-subtle:rgba(82,16,0,0.4);--cf-bg:#FFFBF5;--cf-bg-card:#FFFDFB;--cf-bg-hover:#FEF7ED;--cf-border:#EBD5C1;--cf-success:#16A34A;--cf-error:#DC2626}
@@ -500,6 +558,50 @@ label{display:block;font-size:11px;font-weight:600;text-transform:uppercase;lett
     <div id="users-body"><div class="empty">Loading…</div></div>
   </div>
 
+  <!-- ── Global Tools ── -->
+  <div class="section">
+    <div class="eyebrow">Team Resources</div>
+    <h2>Global Tools</h2>
+    <p class="subtitle" style="margin-bottom:24px">Tools in the shared workspace at <code style="font-family:monospace;font-size:12px;background:rgba(235,213,193,.4);padding:1px 5px;border-radius:3px">/tools/*.json</code> — auto-loaded for <strong>every user</strong> at session start. Personal tools override global tools with the same name.</p>
+    <div class="card" id="global-tools-card">
+      <div class="cb" style="top:-4px;left:-4px"></div><div class="cb" style="top:-4px;right:-4px"></div>
+      <div class="cb" style="bottom:-4px;left:-4px"></div><div class="cb" style="bottom:-4px;right:-4px"></div>
+      <div class="card-hdr">
+        <span class="card-hdr-label">Tools</span>
+        <div style="display:flex;gap:8px;align-items:center">
+          <span id="global-tools-count" class="badge badge-m">—</span>
+          <button onclick="loadGlobalTools()" style="padding:4px 12px;font-size:11px">↻ Refresh</button>
+        </div>
+      </div>
+      <div class="card-body" style="border-bottom:1px solid rgba(235,213,193,.4)">
+        <div style="font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;color:var(--cf-text-muted);margin-bottom:14px">Add / Upload Global Tool</div>
+        <div class="upload-grid" style="margin-bottom:12px">
+          <div class="form-row" style="margin:0">
+            <label for="gt-name">Tool Name <span style="font-weight:400;text-transform:none;letter-spacing:0">(lowercase, underscores)</span></label>
+            <input type="text" id="gt-name" placeholder="my_tool">
+          </div>
+          <div class="form-row" style="margin:0">
+            <label for="gt-desc">Description</label>
+            <input type="text" id="gt-desc" placeholder="What this tool does">
+          </div>
+        </div>
+        <div class="form-row">
+          <label for="gt-schema">Schema <span style="font-weight:400;text-transform:none;letter-spacing:0">(JSON — omit for no-arg tools)</span></label>
+          <textarea id="gt-schema" style="min-height:60px" placeholder='{"input": {"type": "string", "description": "The input"}}'>{}</textarea>
+        </div>
+        <div class="form-row">
+          <label for="gt-code">Code <span style="font-weight:400;text-transform:none;letter-spacing:0">(async arrow function with access to state.*, shared.*, codemode.*)</span></label>
+          <textarea id="gt-code" placeholder="async ({ input }) => { return await shared.readFile(input); }"></textarea>
+        </div>
+        <div style="display:flex;gap:10px;align-items:center">
+          <button class="primary" onclick="uploadGlobalTool()">Add Global Tool</button>
+          <span id="gt-status" style="font-size:12px;color:var(--cf-text-muted)"></span>
+        </div>
+      </div>
+      <div id="global-tools-body"><div class="empty">Loading…</div></div>
+    </div>
+  </div>
+
   <!-- ── Shared Workspace ── -->
   <div class="section">
     <div class="eyebrow">Team Resources</div>
@@ -548,9 +650,9 @@ label{display:block;font-size:11px;font-weight:600;text-transform:uppercase;lett
 let ADMIN_KEY='';const BASE=window.location.origin;
 function toast(msg,ok=true){const el=document.getElementById('toast');el.textContent=msg;el.style.background=ok?'var(--cf-text)':'var(--cf-error)';el.classList.add('show');setTimeout(()=>el.classList.remove('show'),2500);}
 async function api(path,opts={}){const res=await fetch(BASE+'/admin/api'+path,{...opts,headers:{'X-Admin-Key':ADMIN_KEY,'Content-Type':'application/json',...(opts.headers??{})}});if(res.status===401){showAuth();return null;}return res;}
-async function authenticate(){const key=document.getElementById('admin-key').value.trim();if(!key)return;ADMIN_KEY=key;const res=await api('/users');if(!res){document.getElementById('auth-error').style.display='block';ADMIN_KEY='';return;}sessionStorage.setItem('adminKey',key);document.getElementById('auth-overlay').style.display='none';renderUsers(await res.json());loadSharedFiles();}
+async function authenticate(){const key=document.getElementById('admin-key').value.trim();if(!key)return;ADMIN_KEY=key;const res=await api('/users');if(!res){document.getElementById('auth-error').style.display='block';ADMIN_KEY='';return;}sessionStorage.setItem('adminKey',key);document.getElementById('auth-overlay').style.display='none';renderUsers(await res.json());loadGlobalTools();loadSharedFiles();}
 function showAuth(){sessionStorage.removeItem('adminKey');document.getElementById('auth-overlay').style.display='flex';}
-async function loadAll(){await Promise.all([loadUsers(),loadSharedFiles()]);}
+async function loadAll(){await Promise.all([loadUsers(),loadGlobalTools(),loadSharedFiles()]);}
 async function loadUsers(){const res=await api('/users');if(!res)return;renderUsers(await res.json());}
 function renderUsers(users){document.getElementById('user-count').textContent=users.length+' users';if(!users.length){document.getElementById('users-body').innerHTML='<div class="empty">No users yet — they appear automatically after first login.</div>';return;}
 const rows=users.map(u=>{const k=btoa(u.email).replace(/=/g,'');return\`<tr id="row-\${k}"><td><strong>\${u.name}</strong></td><td>\${u.email}</td><td>\${new Date(u.createdAt).toLocaleDateString()}</td><td><span class="badge \${u.fileCount>0?'badge-g':'badge-m'}">\${u.fileCount} files</span></td><td style="white-space:nowrap;display:flex;gap:6px;padding:8px 12px"><button onclick="toggleFiles('\${u.email}')">Files</button><button class="danger" onclick="wipeWorkspace('\${u.email}')">Wipe</button><button class="danger" onclick="removeUser('\${u.email}')">Remove</button></td></tr><tr id="files-\${k}" style="display:none"><td colspan="5" style="padding:0"><div class="files-panel" id="fp-\${k}">Loading…</div></td></tr>\`;}).join('');
@@ -559,6 +661,47 @@ async function removeUser(email){if(!confirm('Remove '+email+'? Workspace files 
 async function wipeWorkspace(email){if(!confirm('Wipe ALL files for '+email+'? This cannot be undone.'))return;const res=await api('/users/'+encodeURIComponent(email)+'/workspace',{method:'DELETE'});if(res?.ok){toast('Workspace wiped');loadUsers();}else toast('Error',false);}
 async function toggleFiles(email){const k=btoa(email).replace(/=/g,''),row=document.getElementById('files-'+k),panel=document.getElementById('fp-'+k);if(row.style.display==='none'){row.style.display='';const res=await api('/users/'+encodeURIComponent(email)+'/files');if(!res)return;const files=await res.json();if(!files.length){panel.innerHTML='<div style="color:var(--cf-text-subtle);font-size:12px;padding:4px 0">No files</div>';return;}panel.innerHTML=files.map(f=>{const isHtml=f.path.endsWith('.html');const viewUrl=BASE+'/view?user='+encodeURIComponent(email)+'&file='+encodeURIComponent(f.path);return\`<div class="file-row"><span class="file-path">\${f.path}</span><div style="display:flex;gap:8px;align-items:center">\${isHtml?'<a class="file-link" href="'+viewUrl+'" target="_blank">View ↗</a>':''}<button style="padding:3px 10px;font-size:11px" class="danger" onclick="deleteUserFile('\${email}','\${f.path}')">Delete</button></div></div>\`;}).join('');}else row.style.display='none';}
 async function deleteUserFile(email,path){if(!confirm('Delete '+path+'?'))return;const res=await api('/users/'+encodeURIComponent(email)+'/files?path='+encodeURIComponent(path),{method:'DELETE'});if(res?.ok){toast('Deleted');const k=btoa(email).replace(/=/g,'');document.getElementById('files-'+k).style.display='none';toggleFiles(email);}else toast('Error',false);}
+
+/* ── Global tools ── */
+async function loadGlobalTools(){const res=await api('/global-tools');if(!res)return;renderGlobalTools(await res.json());}
+function renderGlobalTools(tools){
+  const countEl=document.getElementById('global-tools-count');
+  const bodyEl=document.getElementById('global-tools-body');
+  countEl.textContent=tools.length+' tools';
+  if(!tools.length){bodyEl.innerHTML='<div class="empty">No global tools yet — add one above.</div>';return;}
+  bodyEl.innerHTML='<div style="padding:0 18px">'+tools.map(t=>{
+    const name=t.name||t.path.replace('/tools/','').replace('.json','');
+    return\`<div class="file-row">
+      <div style="flex:1;min-width:0">
+        <span class="file-path">\${name}</span>
+        \${t.description?'<span style="margin-left:10px;font-size:11px;color:var(--cf-text-muted)">'+t.description+'</span>':''}
+      </div>
+      <button style="padding:3px 10px;font-size:11px;flex-shrink:0" class="danger" onclick="deleteGlobalTool(\${JSON.stringify(name)})">Delete</button>
+    </div>\`;
+  }).join('')+'</div>';}
+async function uploadGlobalTool(){
+  const name=document.getElementById('gt-name').value.trim();
+  const desc=document.getElementById('gt-desc').value.trim();
+  const code=document.getElementById('gt-code').value.trim();
+  const schemaRaw=document.getElementById('gt-schema').value.trim();
+  if(!name){toast('Tool name is required',false);return;}
+  if(!code){toast('Code is required',false);return;}
+  let schema={};
+  try{if(schemaRaw&&schemaRaw!=='{}')schema=JSON.parse(schemaRaw);}catch{toast('Schema is not valid JSON',false);return;}
+  const statusEl=document.getElementById('gt-status');statusEl.textContent='Saving…';
+  const res=await api('/global-tools',{method:'POST',body:JSON.stringify({name,description:desc,schema,code})});
+  if(res?.ok){
+    toast('Global tool "'+name+'" saved');
+    document.getElementById('gt-name').value='';document.getElementById('gt-desc').value='';
+    document.getElementById('gt-code').value='';document.getElementById('gt-schema').value='{}';
+    statusEl.textContent='';loadGlobalTools();
+  }else{const err=res?await res.json():null;toast(err?.error||'Failed',false);statusEl.textContent='';}
+}
+async function deleteGlobalTool(name){
+  if(!confirm('Delete global tool "'+name+'"? All users will lose access on their next session.'))return;
+  const res=await api('/global-tools?name='+encodeURIComponent(name),{method:'DELETE'});
+  if(res?.ok){toast('Deleted');loadGlobalTools();}else toast('Error',false);
+}
 
 /* ── Shared workspace ── */
 async function loadSharedFiles(){const res=await api('/shared/files');if(!res)return;renderSharedFiles(await res.json());}

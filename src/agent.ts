@@ -180,20 +180,25 @@ export class SandboxAgent extends McpAgent<Env, Record<string, never>, Props> {
     );
   }
 
-  // Scan /tools/*.json in the user's workspace and register each as an MCP tool.
+  // Scan /tools/*.json and register each as an MCP tool.
+  // Global tools (shared workspace) are loaded first; personal tools load second
+  // and override any global tool with the same name.
   async loadUserTools() {
-    let entries: Array<{ path: string; type: string }> = [];
-    try {
-      entries = await this.workspace.glob("/tools/*.json") as Array<{ path: string; type: string }>;
-    } catch { return; }
-    for (const entry of entries.filter(e => e.type === "file")) {
-      try {
-        const content = await this.workspace.readFile(entry.path);
-        if (!content) continue;
-        const def: UserToolDef = JSON.parse(content);
-        if (def.name && def.description && def.code) this.registerUserTool(def);
-      } catch { /* skip malformed tool files */ }
-    }
+    const loadFrom = async (ws: Workspace) => {
+      let entries: Array<{ path: string; type: string }> = [];
+      try { entries = await ws.glob("/tools/*.json") as Array<{ path: string; type: string }>; }
+      catch { return; }
+      for (const entry of entries.filter(e => e.type === "file")) {
+        try {
+          const content = await ws.readFile(entry.path);
+          if (!content) continue;
+          const def: UserToolDef = JSON.parse(content);
+          if (def.name && def.description && def.code) this.registerUserTool(def);
+        } catch { /* skip malformed */ }
+      }
+    };
+    await loadFrom(this.sharedWorkspace); // global first (lower priority)
+    await loadFrom(this.workspace);       // personal second (can override global)
   }
 
   async init() {
@@ -338,20 +343,27 @@ export class SandboxAgent extends McpAgent<Env, Record<string, never>, Props> {
           "get_report_url", "get_shared_file_url",
           "tool_create", "tool_list", "tool_delete", "tool_reload",
         ];
-        const custom: Array<{ name: string; description: string }> = [];
-        try {
-          const entries = await this.workspace.glob("/tools/*.json") as Array<{ path: string; type: string }>;
-          for (const entry of entries.filter(e => e.type === "file")) {
-            try {
-              const content = await this.workspace.readFile(entry.path);
-              if (!content) continue;
-              const def: UserToolDef = JSON.parse(content);
-              custom.push({ name: def.name, description: def.description });
-            } catch { /* skip */ }
-          }
-        } catch { /* no /tools dir yet */ }
+        const readTools = async (ws: Workspace): Promise<Array<{ name: string; description: string }>> => {
+          const out: Array<{ name: string; description: string }> = [];
+          try {
+            const entries = await ws.glob("/tools/*.json") as Array<{ path: string; type: string }>;
+            for (const entry of entries.filter(e => e.type === "file")) {
+              try {
+                const content = await ws.readFile(entry.path);
+                if (!content) continue;
+                const def: UserToolDef = JSON.parse(content);
+                out.push({ name: def.name, description: def.description });
+              } catch { /* skip */ }
+            }
+          } catch { /* no /tools dir */ }
+          return out;
+        };
+        const [global, personal] = await Promise.all([
+          readTools(this.sharedWorkspace),
+          readTools(this.workspace),
+        ]);
         return {
-          content: [{ type: "text" as const, text: JSON.stringify({ builtIn, custom }, null, 2) }],
+          content: [{ type: "text" as const, text: JSON.stringify({ builtIn, global, personal }, null, 2) }],
         };
       }
     );

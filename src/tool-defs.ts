@@ -94,40 +94,29 @@ export function buildBuiltinToolDefs(domainToolNames: string[]): ToolDef[] {
       ],
     },
 
-    // ── get_report_url ─────────────────────────────────────────────────────
+    // ── get_url ───────────────────────────────────────────────────────────
     {
-      name: "get_report_url",
+      name: "get_url",
       description: [
-        "Get a shareable browser URL for a file written to your personal workspace.",
-        "Use this after generating an HTML report with run_code.",
-        "The URL is stable — tied to your identity, not the current session.",
+        "Get a shareable browser URL for a file in the sandbox workspace.",
+        "Defaults to your personal workspace (state.*). Set shared=true for",
+        "the team shared workspace (shared.*).",
+        "URLs are stable, publicly accessible, and not session-bound.",
       ].join("\n"),
       params: [
         {
           name: "file",
           type: "string",
           description:
-            "Workspace path, e.g. /reports/dashboard.html",
-          required: false,
-        },
-      ],
-    },
-
-    // ── get_shared_file_url ────────────────────────────────────────────────
-    {
-      name: "get_shared_file_url",
-      description: [
-        "Get a shareable browser URL for a file in the team shared workspace.",
-        "Use this to share links to team templates or reports stored in the shared workspace.",
-        "The URL is stable and accessible to anyone with the link.",
-      ].join("\n"),
-      params: [
-        {
-          name: "file",
-          type: "string",
-          description:
-            "Shared workspace path, e.g. /templates/cf-report.html",
+            "Workspace path, e.g. /reports/sales-q4.html",
           required: true,
+        },
+        {
+          name: "shared",
+          type: "boolean",
+          description:
+            "true = shared workspace, false = personal (default)",
+          required: false,
         },
       ],
     },

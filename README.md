@@ -179,7 +179,7 @@ wrangler secret put ADMIN_SECRET
 
 | Variable | Default | Description |
 |---|---|---|
-| `PUBLIC_URL` | `https://ai-sandbox.cloudemo.org` | Base URL used to build shareable `/view` links from `get_report_url`. Update if you use a different domain. |
+| `PUBLIC_URL` | `https://ai-sandbox.cloudemo.org` | Base URL used to build shareable `/view` links from `get_url`. Update if you use a different domain. |
 
 ---
 
@@ -276,9 +276,9 @@ Files written via `state.*` persist permanently across all sessions for that use
 
 Same as `run_code` but bundles npm packages at runtime so the sandbox can `import` them. The Dynamic Worker sandbox receives the bundled modules injected as ES modules. Slower - prefer `run_code` for simple tasks.
 
-### `get_report_url`
+### `get_url`
 
-Returns a stable, shareable URL for any HTML file in the workspace. The link works without login (the `/view` endpoint is public).
+Returns a stable, shareable URL for any file in the workspace. Defaults to your personal workspace (`state.*`); set `shared=true` for the team shared workspace (`shared.*`). The link works without login (the `/view` endpoint is public).
 
 ---
 
@@ -325,7 +325,7 @@ Generate reports from the sandbox and get a shareable link:
 User: "Analyse the pipeline data and create a dashboard"
 
 → run_code writes /reports/pipeline-dashboard.html
-→ get_report_url returns: https://<your-domain>/view?user=alice@example.com&file=/reports/pipeline-dashboard.html
+→ get_url returns: https://<your-domain>/view?user=alice@example.com&file=/reports/pipeline-dashboard.html
 ```
 
 The LLM can use any styling approach - write self-contained HTML with inline CSS and Chart.js, or store reusable design tokens in the workspace (e.g. `/templates/base.css`, `/templates/charts.js`) and read them back with `state.readFile` before composing the final report.

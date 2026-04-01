@@ -311,27 +311,19 @@ export class SandboxAgent extends McpAgent<Env, Record<string, never>, Props> {
       }
     );
 
-    // ── get_report_url ────────────────────────────────────────────────────────
+    // ── get_url ──────────────────────────────────────────────────────────────
     this.server.tool(
-      "get_report_url",
-      toolDesc["get_report_url"],
-      { file: z.string().default("/reports/dashboard.html").describe("Workspace path, e.g. /reports/sales-q4.html") },
-      async ({ file }) => {
-        const base  = this.env.PUBLIC_URL.replace(/\/$/, "");
-        const email = this.props?.email ?? "anonymous";
-        const url   = `${base}/view?user=${encodeURIComponent(email)}&file=${encodeURIComponent(file)}`;
-        return { content: [{ type: "text" as const, text: url }] };
-      }
-    );
-
-    // ── get_shared_file_url ───────────────────────────────────────────────────
-    this.server.tool(
-      "get_shared_file_url",
-      toolDesc["get_shared_file_url"],
-      { file: z.string().describe("Shared workspace path, e.g. /templates/cf-report.html") },
-      async ({ file }) => {
+      "get_url",
+      toolDesc["get_url"],
+      {
+        file: z.string().describe("Workspace path, e.g. /reports/sales-q4.html"),
+        shared: z.boolean().default(false).describe("true = shared workspace, false = personal (default)"),
+      },
+      async ({ file, shared }) => {
         const base = this.env.PUBLIC_URL.replace(/\/$/, "");
-        const url  = `${base}/view?shared=true&file=${encodeURIComponent(file)}`;
+        const url = shared
+          ? `${base}/view?shared=true&file=${encodeURIComponent(file)}`
+          : `${base}/view?user=${encodeURIComponent(this.props?.email ?? "anonymous")}&file=${encodeURIComponent(file)}`;
         return { content: [{ type: "text" as const, text: url }] };
       }
     );
@@ -369,7 +361,7 @@ export class SandboxAgent extends McpAgent<Env, Record<string, never>, Props> {
       async () => {
         const builtIn = [
           "run_code", "run_bundled_code",
-          "get_report_url", "get_shared_file_url",
+          "get_url",
           "tool_create", "tool_list", "tool_delete", "tool_reload",
         ];
         const readTools = async (ws: Workspace): Promise<Array<{ name: string; description: string; path: string }>> => {

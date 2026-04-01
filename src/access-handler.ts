@@ -720,6 +720,8 @@ tr:hover td{background:var(--cf-bg-hover)}
 .file-viewer{background:#1C0A00;color:#f5e6d3;font-family:"SF Mono","Fira Code",monospace;font-size:12px;line-height:1.5;padding:13px 14px;min-height:160px;max-height:320px;overflow-y:auto;white-space:pre-wrap;word-break:break-all;border:1px solid #3a1500}
 .toast{position:fixed;bottom:18px;right:20px;background:var(--cf-text);color:var(--cf-bg);padding:8px 16px;border-radius:9999px;font-size:12px;font-weight:500;opacity:0;transition:opacity .2s;pointer-events:none;z-index:500}
 .toast.show{opacity:1}
+.file-editor-ta{background:#1C0A00;color:#f5e6d3;font-family:"SF Mono","Fira Code",monospace;font-size:12px;line-height:1.5;padding:13px 14px;min-height:300px;max-height:500px;overflow-y:auto;resize:vertical;width:100%;outline:none;border:1px solid #3a1500;display:block;border-radius:0}
+.file-editor-ta:focus{border-color:var(--cf-orange)}
 </style>
 </head>
 <body>
@@ -810,9 +812,12 @@ tr:hover td{background:var(--cf-bg-hover)}
           <div id="file-tree"><div class="empty">Select a workspace and click Load Files.</div></div>
         </div>
         <div class="fb-action">
-          <div class="viewer-lbl">File Content</div>
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:5px">
+            <div class="viewer-lbl">File Editor</div>
+            <button class="sm primary" id="save-file-btn" style="display:none">Save</button>
+          </div>
           <div class="viewer-filepath" id="viewer-path">Select a file to view its contents</div>
-          <div class="file-viewer" id="file-viewer">Select a file to view its contents.</div>
+          <textarea class="file-editor-ta" id="file-editor" placeholder="Select a file to edit its contents." readonly></textarea>
         </div>
       </div>
     </div>
@@ -840,7 +845,7 @@ tr:hover td{background:var(--cf-bg-hover)}
 </div></div>
 <div class="toast" id="toast"></div>
 <script>
-var ADMIN_KEY='',BASE=window.location.origin,bWs='shared',bPath='/',bFiles=[];
+var ADMIN_KEY='',BASE=window.location.origin,bWs='shared',bPath='/',bFiles=[],pendingEditFile=null,currentEditPath='';
 var logLevel='all',logTimer=null;
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 function toast(msg,ok){var el=document.getElementById('toast');el.textContent=msg;el.style.background=(ok===false)?'var(--cf-error)':'var(--cf-text)';el.classList.add('show');setTimeout(function(){el.classList.remove('show');},2500);}
@@ -857,6 +862,7 @@ document.getElementById('refresh-btn').addEventListener('click',loadUsers);
 async function removeUser(email){if(!confirm('Remove '+email+'? Workspace files are NOT deleted.'))return;var res=await api('/users/'+encodeURIComponent(email),{method:'DELETE'});if(res&&res.ok){toast('User removed');loadUsers();}else toast('Error',false);}
 async function wipeWorkspace(email){if(!confirm('Wipe ALL files for '+email+'? This cannot be undone.'))return;var res=await api('/users/'+encodeURIComponent(email)+'/workspace',{method:'DELETE'});if(res&&res.ok){toast('Workspace wiped');loadUsers();}else toast('Error',false);}
 function browseUserFiles(email){bWs=email;bPath='/';bFiles=[];showSection('files');}
+function editToolJson(toolJsonPath){var dir=toolJsonPath.substring(0,toolJsonPath.lastIndexOf('/'));bWs='shared';bPath=dir;pendingEditFile=toolJsonPath;showSection('files');}
 async function loadTools(){document.getElementById('tools-body').innerHTML='<div class="empty">Loading&hellip;</div>';var res=await api('/tools');if(!res||!res.ok){document.getElementById('tools-body').innerHTML='<div class="empty">Could not load tools.</div>';return;}renderTools(await res.json());}
 function renderTools(data){
   var html='';
@@ -881,6 +887,9 @@ function renderTools(data){
   document.getElementById('tools-body').querySelectorAll('button[data-browse-tool]').forEach(function(btn){
     btn.addEventListener('click',function(){browseUserFiles('shared');setTimeout(function(){var f=btn.dataset.browseDir;if(f){bPath=f;renderTree();}},200);});
   });
+  document.getElementById('tools-body').querySelectorAll('button[data-edit-json]').forEach(function(btn){
+    btn.addEventListener('click',function(){editToolJson(btn.dataset.editJson);});
+  });
 }
 function toolCard(t,type){
   var raw=t.params||t.schema||[];
@@ -892,6 +901,7 @@ function toolCard(t,type){
       var toolDir=t._files[0].substring(0,t._files[0].lastIndexOf('/'));
       actions+=' <button class="sm files-toggle">Files &#9656;</button>';
       actions+=' <button class="sm" data-browse-tool="'+esc(t.name)+'" data-browse-dir="'+esc(toolDir)+'">Browse</button>';
+      actions+=' <button class="sm" data-edit-json="'+esc(toolDir+'/tool.json')+'">Edit JSON</button>';
     }
     actions+=' <button class="sm danger" data-del-tool="'+esc(t.name)+'">Delete</button>';
   }
@@ -907,15 +917,17 @@ function toolCard(t,type){
 }
 async function deleteGlobalTool(name){if(!confirm('Delete global tool "'+name+'"?'))return;var res=await api('/global-tools?name='+encodeURIComponent(name),{method:'DELETE'});if(res&&res.ok){toast('Tool deleted');loadTools();}else toast('Error',false);}
 async function populateWsSel(selectEmail){var sel=document.getElementById('ws-sel');var cur=selectEmail||sel.value||bWs;var res=await api('/users');if(!res)return;var users=await res.json();var opts='<option value="shared">Shared Workspace</option>';users.forEach(function(u){opts+='<option value="'+esc(u.email)+'">'+esc(u.email)+'</option>';});sel.innerHTML=opts;sel.value=cur;bWs=sel.value;}
-async function loadBrowserFiles(){var ws=document.getElementById('ws-sel').value||'shared';bWs=ws;bFiles=[];resetViewer();document.getElementById('file-tree').innerHTML='<div class="empty">Loading\u2026</div>';var res=await api('/files?workspace='+encodeURIComponent(ws));if(!res)return;bFiles=await res.json();renderTree();}
+async function loadBrowserFiles(){var ws=document.getElementById('ws-sel').value||'shared';bWs=ws;bFiles=[];resetViewer();document.getElementById('file-tree').innerHTML='<div class="empty">Loading\u2026</div>';var res=await api('/files?workspace='+encodeURIComponent(ws));if(!res)return;bFiles=await res.json();renderTree();if(pendingEditFile){var pef=pendingEditFile;pendingEditFile=null;await viewFile(pef);document.querySelectorAll('#file-tree .tree-row').forEach(function(r){if(r.dataset.path===pef)r.classList.add('selected');});}}
 function listDir(){var prefix=bPath==='/'?'/':bPath+'/';var seen=new Set(),dirs=[],files=[];bFiles.forEach(function(f){if(!f.path.startsWith(prefix))return;var rest=f.path.slice(prefix.length);if(!rest)return;var slash=rest.indexOf('/');if(slash===-1){if(!f.path.endsWith('/.keep'))files.push(f);}else{var d=rest.slice(0,slash);if(!seen.has(d)){seen.add(d);dirs.push(d);}}});return{dirs:dirs.sort(),files:files.sort(function(a,b){return a.path.localeCompare(b.path);})};}
 function renderTree(){var info=listDir();var all=info.dirs.length+info.files.length;document.getElementById('fb-path').textContent=bPath;document.getElementById('fb-count').textContent=all+' ITEM'+(all!==1?'S':'');var html='';if(bPath!=='/')html+='<div class="tree-row" data-type="up"><span style="font-size:12px;color:var(--cf-text-muted)">&#8593;</span><span class="tree-name">..</span></div>';info.dirs.forEach(function(d){var dp=(bPath==='/'?'':bPath)+'/'+d;html+='<div class="tree-row" data-type="dir" data-path="'+esc(dp)+'"><span style="font-size:14px">&#128193;</span><span class="tree-name">'+esc(d)+'/</span><button class="tree-del" data-path="'+esc(dp)+'" data-deltype="dir" title="Delete directory">&#215;</button></div>';});info.files.forEach(function(f){var name=f.path.split('/').pop();var sz=f.size<1024?f.size+' B':(f.size<1048576?Math.round(f.size/1024)+' KB':Math.round(f.size/1048576)+' MB');var vu=getViewUrl(f.path);html+='<div class="tree-row" data-type="file" data-path="'+esc(f.path)+'"><span style="font-size:14px">&#128196;</span><span class="tree-name">'+esc(name)+'</span><span class="tree-size">'+sz+'</span><a class="tree-url" href="'+esc(vu)+'" target="_blank" rel="noopener" title="Open in browser">&#128279;</a><button class="tree-del" data-path="'+esc(f.path)+'" data-deltype="file" title="Delete">&#215;</button></div>';});if(!html)html='<div class="empty" style="padding:20px">Empty directory</div>';document.getElementById('file-tree').innerHTML=html;}
 document.getElementById('file-tree').addEventListener('click',function(e){if(e.target.closest('.tree-url'))return;var del=e.target.closest('.tree-del');if(del){e.stopPropagation();if(del.dataset.deltype==='dir')delDir(del.dataset.path);else delFile(del.dataset.path);return;}var row=e.target.closest('.tree-row');if(!row)return;var type=row.dataset.type;if(type==='up'){var parts=bPath.split('/').filter(Boolean);parts.pop();bPath=parts.length?'/'+parts.join('/'):'/';;renderTree();}else if(type==='dir'){bPath=row.dataset.path;renderTree();}else if(type==='file'){viewFile(row.dataset.path);document.querySelectorAll('.tree-row').forEach(function(r){r.classList.remove('selected');});row.classList.add('selected');}});
 function getViewUrl(path){var base=window.location.origin;if(bWs==='shared')return base+'/view?shared=true&file='+encodeURIComponent(path);return base+'/view?user='+encodeURIComponent(bWs)+'&file='+encodeURIComponent(path);}
-function resetViewer(){document.getElementById('viewer-path').textContent='Select a file to view its contents';document.getElementById('file-viewer').textContent='Select a file to view its contents.';}
-async function viewFile(path){document.getElementById('viewer-path').textContent=path;document.getElementById('file-viewer').textContent='Loading\u2026';var res=await api('/files/read?workspace='+encodeURIComponent(bWs)+'&path='+encodeURIComponent(path));if(!res)return;var content=await res.text();document.getElementById('file-viewer').textContent=content;}
+function resetViewer(){currentEditPath='';document.getElementById('viewer-path').textContent='Select a file to view its contents';var editor=document.getElementById('file-editor');editor.value='';editor.setAttribute('readonly','');document.getElementById('save-file-btn').style.display='none';}
+async function viewFile(path){currentEditPath=path;document.getElementById('viewer-path').textContent=path;var editor=document.getElementById('file-editor');editor.value='Loading\u2026';editor.removeAttribute('readonly');document.getElementById('save-file-btn').style.display='';var res=await api('/files/read?workspace='+encodeURIComponent(bWs)+'&path='+encodeURIComponent(path));if(!res)return;var content=await res.text();editor.value=content;}
 async function delFile(path){if(!confirm('Delete '+path+'?'))return;var res=await api('/files?workspace='+encodeURIComponent(bWs)+'&path='+encodeURIComponent(path),{method:'DELETE'});if(res&&res.ok){toast('Deleted');bFiles=bFiles.filter(function(f){return f.path!==path;});renderTree();}else toast('Delete failed',false);}
 async function delDir(dirPath){var children=bFiles.filter(function(f){return f.path===dirPath+'/.keep'||f.path.startsWith(dirPath+'/');});var count=children.filter(function(f){return!f.path.endsWith('/.keep');}).length;var msg=count>0?'Delete directory '+dirPath+' and all '+count+' file(s) inside?':'Delete empty directory '+dirPath+'?';if(!confirm(msg))return;var failed=0;for(var i=0;i<children.length;i++){var r=await api('/files?workspace='+encodeURIComponent(bWs)+'&path='+encodeURIComponent(children[i].path),{method:'DELETE'});if(!r||!r.ok)failed++;}if(failed)toast(failed+' deletion(s) failed',false);else toast('Directory deleted');loadBrowserFiles();}
+async function saveFile(){if(!currentEditPath)return;var content=document.getElementById('file-editor').value;var res=await api('/files/write?workspace='+encodeURIComponent(bWs)+'&path='+encodeURIComponent(currentEditPath),{method:'POST',body:content});if(res&&res.ok)toast('Saved');else toast('Save failed',false);}
+document.getElementById('save-file-btn').addEventListener('click',saveFile);
 document.getElementById('ws-sel').addEventListener('change',function(){bWs=this.value;bPath='/';bFiles=[];loadBrowserFiles();});
 window.addEventListener('load',function(){var s=sessionStorage.getItem('adminKey');if(s){document.getElementById('admin-key').value=s;authenticate();}});
 document.getElementById('admin-key').addEventListener('keydown',function(e){if(e.key==='Enter')authenticate();});

@@ -25,6 +25,116 @@ interface UserRecord {
   createdAt: string;
 }
 
+// ─── Built-in tool definitions (mirrors BUILTIN_TOOL_DEFS in agent.ts) ──────
+// Kept here so /admin/api/tools can be served from the stateless Worker
+// without routing through a DO stub (which is unreliable for cold starts).
+
+const ADMIN_BUILTIN_TOOLS = [
+  {
+    name: "run_code",
+    description: [
+      "Execute JavaScript code in an isolated V8 sandbox (~2ms startup, no network).",
+      "",
+      "Available in sandbox:",
+      "  state.*     — your personal workspace: readFile, writeFile, glob, searchFiles,",
+      "                replaceInFiles, diff, readJson, writeJson, walkTree, ...",
+      "  shared.*    — team shared workspace: same API as state.*, readable and writable by all users.",
+      "                Use this to access shared templates, configs, and team resources.",
+      "  codemode.*  — domain tools: kvGet, kvSet, kvList, kvDelete",
+      "  gitprism.*  — ingest_repo({ url, detail? })",
+      "                Converts a public GitHub repo to Markdown.",
+      "                detail: 'summary' | 'structure' | 'file-list' | 'full'",
+      "",
+      "Files written via state.* persist in your personal workspace.",
+      "Files written via shared.* are immediately visible to all team members.",
+      "The code must be an async arrow function or a block of statements.",
+    ].join("\n"),
+    params: [
+      { name: "code", type: "string", description: "JavaScript to run. Can use state.*, shared.*, codemode.*, and gitprism.*", required: true },
+    ],
+  },
+  {
+    name: "run_bundled_code",
+    description: [
+      "Like run_code, but installs npm packages at runtime so the sandbox can import them.",
+      "Prefer run_code for simple tasks — it's much faster.",
+      "Use dynamic import(): const { chunk } = await import('lodash');",
+      "state.*, shared.*, codemode.*, and gitprism.* are available exactly as in run_code.",
+    ].join("\n"),
+    params: [
+      { name: "code",     type: "string", description: "JavaScript to run. Use dynamic import() to load declared packages.", required: true },
+      { name: "packages", type: "object", description: "npm packages: { name: versionRange }", required: false },
+    ],
+  },
+  {
+    name: "get_report_url",
+    description: [
+      "Get a shareable browser URL for a file written to your personal workspace.",
+      "Use this after generating an HTML report with run_code.",
+      "The URL is stable — tied to your identity, not the current session.",
+    ].join("\n"),
+    params: [
+      { name: "file", type: "string", description: "Workspace path, e.g. /reports/dashboard.html", required: false },
+    ],
+  },
+  {
+    name: "get_shared_file_url",
+    description: [
+      "Get a shareable browser URL for a file in the team shared workspace.",
+      "Use this to share links to team templates or reports stored in the shared workspace.",
+      "The URL is stable and accessible to anyone with the link.",
+    ].join("\n"),
+    params: [
+      { name: "file", type: "string", description: "Shared workspace path, e.g. /templates/cf-report.html", required: true },
+    ],
+  },
+  {
+    name: "tool_create",
+    description: [
+      "Create or update a reusable custom MCP tool in your personal workspace.",
+      "The tool is saved to /tools/{name}.json and registered immediately in this session.",
+      "It will be auto-loaded at the start of every future session.",
+      "",
+      "Schema format: { fieldName: { type, description?, optional? } }",
+      "  type: 'string' | 'number' | 'boolean' | 'array' | 'object'",
+      "",
+      "Code: an async arrow function receiving the tool args as an object.",
+      "  It has access to state.*, shared.*, codemode.*, gitprism.* — same as run_code.",
+    ].join("\n"),
+    params: [
+      { name: "name",        type: "string", description: "Tool name — lowercase letters, digits, and underscores only", required: true },
+      { name: "description", type: "string", description: "What the tool does — shown to the AI in every session",        required: true },
+      { name: "schema",      type: "object", description: "Parameter schema — omit or pass {} for no-arg tools",          required: false },
+      { name: "code",        type: "string", description: "Async arrow function, e.g. async ({ arg1 }) => { ... }",       required: true },
+    ],
+  },
+  {
+    name: "tool_list",
+    description: "List all available MCP tools — built-in tools and your custom tools loaded from /tools/*.json.",
+    params: [],
+  },
+  {
+    name: "tool_delete",
+    description: [
+      "Delete a custom tool from your workspace.",
+      "The /tools/{name}.json file is removed immediately.",
+      "The tool remains callable for the rest of this session but will not load in future sessions.",
+    ].join("\n"),
+    params: [
+      { name: "name", type: "string", description: "Name of the custom tool to delete", required: true },
+    ],
+  },
+  {
+    name: "tool_reload",
+    description: [
+      "Reload custom tools from /tools/*.json in your workspace.",
+      "Use this after writing tool files manually via run_code to register them",
+      "in the current session without starting a new one.",
+    ].join("\n"),
+    params: [],
+  },
+];
+
 // ─── Content types for /view ──────────────────────────────────────────────────
 
 const CONTENT_TYPES: Record<string, string> = {
@@ -125,6 +235,7 @@ export async function handleRequest(
 
     // Auto-provision user record on first login
     await ensureUserRecord(email, claims.name ?? email, env);
+    writeLog(env as Env, _ctx, "info", "auth.login", { email, name: claims.name ?? email, colo: (request.cf as Record<string, string> | undefined)?.colo });
 
     const user: Props = {
       accessToken: accessToken!,
@@ -170,7 +281,7 @@ export async function handleRequest(
   if (pathname === "/admin") return adminDashboard();
 
   // ── Admin API ─────────────────────────────────────────────────────────────
-  if (pathname.startsWith("/admin/api")) return handleAdminApi(request, env);
+  if (pathname.startsWith("/admin/api")) return handleAdminApi(request, env, _ctx);
 
   return new Response("Not found", { status: 404 });
 }
@@ -283,6 +394,40 @@ async function verifyAccessToken(env: Env, token: string): Promise<Record<string
   return payload;
 }
 
+// ─── Observability ────────────────────────────────────────────────────────────
+// Structured logging: writes to console (visible in Cloudflare Workers Observability
+// and `wrangler tail`) AND stores a ring-buffer in KV for the admin panel.
+
+type LogLevel = "info" | "warn" | "error";
+
+interface LogEntry {
+  ts:    string;
+  level: LogLevel;
+  event: string;
+  data:  Record<string, unknown>;
+}
+
+const LOG_TTL  = 7 * 24 * 60 * 60; // 7 days
+const LOG_KEY  = (ts: string) => `log:${ts}_${Math.random().toString(36).slice(2, 8)}`;
+
+function writeLog(
+  env: Env,
+  ctx: ExecutionContext,
+  level: LogLevel,
+  event: string,
+  data: Record<string, unknown> = {},
+): void {
+  const entry: LogEntry = { ts: new Date().toISOString(), level, event, data };
+  const line = JSON.stringify(entry);
+  if (level === "error") console.error(line);
+  else if (level === "warn") console.warn(line);
+  else console.log(line);
+  // Non-blocking KV write — TTL auto-expires entries after 7 days
+  ctx.waitUntil(
+    env.USER_REGISTRY.put(LOG_KEY(entry.ts), line, { expirationTtl: LOG_TTL })
+  );
+}
+
 // ─── Admin API ────────────────────────────────────────────────────────────────
 
 function isAdmin(request: Request, env: Env): boolean {
@@ -293,15 +438,37 @@ function jsonResp(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
 }
 
-async function handleAdminApi(request: Request, env: Env): Promise<Response> {
-  if (!isAdmin(request, env)) return jsonResp({ error: "Unauthorized" }, 401);
+async function handleAdminApi(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  if (!isAdmin(request, env)) {
+    writeLog(env, ctx, "warn", "admin.auth.fail", { ip: request.headers.get("cf-connecting-ip") ?? "unknown" });
+    return jsonResp({ error: "Unauthorized" }, 401);
+  }
 
   const url    = new URL(request.url);
   const path   = url.pathname.replace(/^\/admin\/api/, "");
   const method = request.method.toUpperCase();
 
+  // ── GET /logs — fetch recent log entries from KV ring-buffer ──────────────
+  if (method === "GET" && path === "/logs") {
+    const limit = Math.min(parseInt(url.searchParams.get("limit") ?? "200"), 500);
+    const levelFilter = url.searchParams.get("level") ?? "all";
+    try {
+      const list = await env.USER_REGISTRY.list({ prefix: "log:", limit });
+      const entries = await Promise.all(
+        list.keys.map(async k => {
+          const raw = await env.USER_REGISTRY.get(k.name);
+          if (!raw) return null;
+          try { return JSON.parse(raw) as LogEntry; } catch { return null; }
+        })
+      );
+      let logs = entries.filter(Boolean) as LogEntry[];
+      if (levelFilter !== "all") logs = logs.filter(l => l.level === levelFilter);
+      logs.sort((a, b) => b.ts.localeCompare(a.ts)); // newest first
+      return jsonResp(logs);
+    } catch (err) { return jsonResp({ error: String(err) }, 500); }
+  }
+
   // ── Global tools endpoints (shared workspace /tools/*.json) ──────────────────
-  // Global tools auto-load for ALL users at session start (higher priority than personal).
 
   // GET /global-tools
   if (method === "GET" && path === "/global-tools") {
@@ -322,90 +489,91 @@ async function handleAdminApi(request: Request, env: Env): Promise<Response> {
     } catch (err) { return jsonResp({ error: String(err) }, 500); }
   }
 
-  // POST /global-tools — upload a tool JSON to shared workspace
-  // Body: { name, description, schema, code }  OR  { path, content } for raw upload
+  // POST /global-tools
   if (method === "POST" && path === "/global-tools") {
     try {
       const body = await request.json<{ name?: string; description?: string; schema?: unknown; code?: string; path?: string; content?: string }>();
       let filePath: string;
       let fileContent: string;
       if (body.path && body.content !== undefined) {
-        // Raw file upload
-        filePath = body.path;
+        filePath    = body.path;
         fileContent = body.content;
       } else if (body.name && body.code) {
-        // Structured tool upload
-        filePath = `/tools/${body.name}.json`;
+        filePath    = `/tools/${body.name}.json`;
         fileContent = JSON.stringify({ name: body.name, description: body.description ?? "", schema: body.schema ?? {}, code: body.code }, null, 2);
       } else {
         return jsonResp({ error: "Provide either {name, code} or {path, content}" }, 400);
       }
       const ws = makeSharedWorkspace(env);
       await ws.writeFile(filePath, fileContent);
+      writeLog(env, ctx, "info", "admin.tools.upload", { path: filePath });
       return jsonResp({ uploaded: filePath });
-    } catch (err) { return jsonResp({ error: String(err) }, 500); }
+    } catch (err) {
+      writeLog(env, ctx, "error", "admin.tools.upload.error", { error: String(err) });
+      return jsonResp({ error: String(err) }, 500);
+    }
   }
 
-  // DELETE /global-tools?name=... — remove from shared workspace
+  // DELETE /global-tools?name=...
   if (method === "DELETE" && path === "/global-tools") {
     const name = url.searchParams.get("name");
     if (!name) return jsonResp({ error: "Missing ?name=" }, 400);
     try {
-      const ws = makeSharedWorkspace(env);
-      await ws.rm(`/tools/${name}.json`);
+      await makeSharedWorkspace(env).rm(`/tools/${name}.json`);
+      writeLog(env, ctx, "info", "admin.tools.delete", { name });
       return jsonResp({ deleted: name });
-    } catch (err) { return jsonResp({ error: String(err) }, 500); }
+    } catch (err) {
+      writeLog(env, ctx, "error", "admin.tools.delete.error", { name, error: String(err) });
+      return jsonResp({ error: String(err) }, 500);
+    }
   }
 
   // ── Shared workspace endpoints ─────────────────────────────────────────────
 
-  // GET /shared/files — list all files in the shared workspace
   if (method === "GET" && path === "/shared/files") {
     try {
-      const ws = makeSharedWorkspace(env);
-      const entries = await ws.glob("/**/*") as Array<{ path: string; type: string; size: number }>;
-      const files = entries.filter(e => e.type === "file").map(e => ({ path: e.path, size: e.size }));
-      return jsonResp(files);
+      const entries = await makeSharedWorkspace(env).glob("/**/*") as Array<{ path: string; type: string; size: number }>;
+      return jsonResp(entries.filter(e => e.type === "file").map(e => ({ path: e.path, size: e.size })));
     } catch (err) { return jsonResp({ error: String(err) }, 500); }
   }
 
-  // POST /shared/files — upload a file to the shared workspace
-  // Body: { path: string, content: string }
   if (method === "POST" && path === "/shared/files") {
     try {
       const body = await request.json<{ path: string; content: string }>();
-      if (!body.path)    return jsonResp({ error: "path is required" }, 400);
+      if (!body.path)              return jsonResp({ error: "path is required" }, 400);
       if (body.content === undefined) return jsonResp({ error: "content is required" }, 400);
-      const ws = makeSharedWorkspace(env);
-      await ws.writeFile(body.path, body.content);
+      await makeSharedWorkspace(env).writeFile(body.path, body.content);
+      writeLog(env, ctx, "info", "admin.shared.write", { path: body.path, bytes: body.content.length });
       return jsonResp({ uploaded: body.path });
-    } catch (err) { return jsonResp({ error: String(err) }, 500); }
+    } catch (err) {
+      writeLog(env, ctx, "error", "admin.shared.write.error", { error: String(err) });
+      return jsonResp({ error: String(err) }, 500);
+    }
   }
 
-  // DELETE /shared/files?path=... — remove a file from the shared workspace
   if (method === "DELETE" && path === "/shared/files") {
     const filePath = url.searchParams.get("path");
     if (!filePath) return jsonResp({ error: "Missing ?path=" }, 400);
     try {
-      const ws = makeSharedWorkspace(env);
-      await ws.rm(filePath);
+      await makeSharedWorkspace(env).rm(filePath);
+      writeLog(env, ctx, "info", "admin.shared.delete", { path: filePath });
       return jsonResp({ deleted: filePath });
-    } catch (err) { return jsonResp({ error: String(err) }, 500); }
+    } catch (err) {
+      writeLog(env, ctx, "error", "admin.shared.delete.error", { path: filePath, error: String(err) });
+      return jsonResp({ error: String(err) }, 500);
+    }
   }
 
   // ── User endpoints ─────────────────────────────────────────────────────────
 
-  // GET /users
   if (method === "GET" && path === "/users") {
     const list = await env.USER_REGISTRY.list({ prefix: "user:" });
     const users = await Promise.all(list.keys.map(async k => {
       const r = await env.USER_REGISTRY.get<UserRecord>(k.name, "json");
       if (!r) return null;
-      // Count workspace files (glob returns file-info objects — filter to files only)
       let fileCount = 0;
       try {
-        const ws = makeWorkspace(r.email, env);
-        const entries = await ws.glob("/**/*") as Array<{ type: string }>;
+        const entries = await makeWorkspace(r.email, env).glob("/**/*") as Array<{ type: string }>;
         fileCount = entries.filter(e => e.type === "file").length;
       } catch { /* workspace may be empty */ }
       return { ...r, fileCount };
@@ -413,11 +581,11 @@ async function handleAdminApi(request: Request, env: Env): Promise<Response> {
     return jsonResp(users.filter(Boolean));
   }
 
-  // POST /users
   if (method === "POST" && path === "/users") {
     const body = await request.json<{ name?: string; email: string }>();
     if (!body.email) return jsonResp({ error: "email is required" }, 400);
     await ensureUserRecord(body.email, body.name ?? body.email, env);
+    writeLog(env, ctx, "info", "admin.users.provision", { email: body.email });
     return jsonResp({ email: body.email, name: body.name ?? body.email }, 201);
   }
 
@@ -426,54 +594,60 @@ async function handleAdminApi(request: Request, env: Env): Promise<Response> {
     const email = decodeURIComponent(userMatch[1]);
     const sub   = userMatch[2] ?? "";
 
-    // DELETE /users/:email — remove from registry (keeps workspace data in D1)
     if (method === "DELETE" && sub === "") {
       await env.USER_REGISTRY.delete(`user:${email}`);
+      writeLog(env, ctx, "info", "admin.users.remove", { email });
       return jsonResp({ deleted: email });
     }
 
     const workspace = makeWorkspace(email, env);
 
-    // GET /users/:email/files
     if (method === "GET" && sub === "/files") {
       try {
-        // glob() returns file-info objects {path, name, type, size, ...}, not strings
         const entries = await workspace.glob("/**/*") as Array<{ path: string; type: string; size: number }>;
-        const files = entries.filter(e => e.type === "file").map(e => ({ path: e.path, size: e.size }));
-        return jsonResp(files);
+        return jsonResp(entries.filter(e => e.type === "file").map(e => ({ path: e.path, size: e.size })));
       } catch (err) { return jsonResp({ error: String(err) }, 500); }
     }
 
-    // DELETE /users/:email/workspace
     if (method === "DELETE" && sub === "/workspace") {
       try {
         const entries = await workspace.glob("/**/*") as Array<{ path: string; type: string }>;
         await Promise.all(entries.filter(e => e.type === "file").map(e => workspace.rm(e.path)));
+        writeLog(env, ctx, "info", "admin.workspace.wipe", { email, files: entries.length });
       } catch { /* already empty */ }
       return jsonResp({ wiped: email });
     }
 
-    // DELETE /users/:email/files?path=...
     if (method === "DELETE" && sub === "/files") {
       const filePath = url.searchParams.get("path");
       if (!filePath) return jsonResp({ error: "Missing ?path=" }, 400);
       await workspace.rm(filePath);
+      writeLog(env, ctx, "info", "admin.files.delete", { email, path: filePath });
       return jsonResp({ deleted: filePath });
     }
   }
 
-  // ── GET /tools — list all tools via DO (built-in + custom from shared ws) ──
+  // ── GET /tools — list all tools (built-in static + custom from shared ws) ──
   if (method === "GET" && path === "/tools") {
-    const id   = env.SandboxAgent.idFromName("__admin_tools__");
-    const stub = env.SandboxAgent.get(id);
-    return stub.fetch(new Request("http://do/internal/tools", {
-      headers: { "X-Admin-Key": env.ADMIN_SECRET ?? "" },
-    }));
+    const ws = makeSharedWorkspace(env);
+    let customTools: unknown[] = [];
+    try {
+      const entries = await ws.glob("/tools/*.json") as Array<{ path: string; type: string }>;
+      const loaded = await Promise.all(
+        entries.filter(e => e.type === "file").map(async (e) => {
+          const raw = await ws.readFile(e.path);
+          if (!raw) return null;
+          try { return JSON.parse(raw); } catch { return null; }
+        })
+      );
+      customTools = loaded.filter(Boolean);
+    } catch { /* shared workspace empty */ }
+    writeLog(env, ctx, "info", "admin.tools.list", { builtin: ADMIN_BUILTIN_TOOLS.length, custom: customTools.length });
+    return jsonResp({ builtin: ADMIN_BUILTIN_TOOLS, custom: customTools });
   }
 
   // ── Unified file-browser endpoints ─────────────────────────────────────────
 
-  // GET /files?workspace=X  — list all files with sizes
   if (method === "GET" && path === "/files") {
     const wsName = url.searchParams.get("workspace");
     if (!wsName) return jsonResp({ error: "Missing ?workspace=" }, 400);
@@ -484,18 +658,15 @@ async function handleAdminApi(request: Request, env: Env): Promise<Response> {
     } catch { return jsonResp([]); }
   }
 
-  // GET /files/read?workspace=X&path=P  — read file content
   if (method === "GET" && path === "/files/read") {
     const wsName   = url.searchParams.get("workspace");
     const filePath = url.searchParams.get("path");
     if (!wsName || !filePath) return jsonResp({ error: "Missing params" }, 400);
-    const ws      = wsName === "shared" ? makeSharedWorkspace(env) : makeWorkspace(wsName, env);
-    const content = await ws.readFile(filePath);
+    const content = await (wsName === "shared" ? makeSharedWorkspace(env) : makeWorkspace(wsName, env)).readFile(filePath);
     if (content === null) return jsonResp({ error: "File not found" }, 404);
     return new Response(content, { headers: { "Content-Type": "text/plain; charset=utf-8" } });
   }
 
-  // POST /files/write?workspace=X&path=P  — write file (body = raw content)
   if (method === "POST" && path === "/files/write") {
     const wsName   = url.searchParams.get("workspace");
     const filePath = url.searchParams.get("path");
@@ -503,29 +674,36 @@ async function handleAdminApi(request: Request, env: Env): Promise<Response> {
     const content = await request.text();
     const ws = wsName === "shared" ? makeSharedWorkspace(env) : makeWorkspace(wsName, env);
     await ws.writeFile(filePath, content);
+    writeLog(env, ctx, "info", "admin.files.write", { workspace: wsName, path: filePath, bytes: content.length });
     return jsonResp({ written: filePath });
   }
 
-  // POST /files/mkdir?workspace=X&path=P  — create directory (writes .keep placeholder)
   if (method === "POST" && path === "/files/mkdir") {
     const wsName  = url.searchParams.get("workspace");
     const dirPath = url.searchParams.get("path");
     if (!wsName || !dirPath) return jsonResp({ error: "Missing params" }, 400);
     const ws = wsName === "shared" ? makeSharedWorkspace(env) : makeWorkspace(wsName, env);
     await ws.writeFile(dirPath.replace(/\/*$/, "") + "/.keep", "");
+    writeLog(env, ctx, "info", "admin.files.mkdir", { workspace: wsName, path: dirPath });
     return jsonResp({ created: dirPath });
   }
 
-  // DELETE /files?workspace=X&path=P  — delete single file (all workspaces)
   if (method === "DELETE" && path === "/files") {
     const wsName   = url.searchParams.get("workspace");
     const filePath = url.searchParams.get("path");
     if (!wsName || !filePath) return jsonResp({ error: "Missing params" }, 400);
     const ws = wsName === "shared" ? makeSharedWorkspace(env) : makeWorkspace(wsName, env);
-    try { await ws.rm(filePath); } catch (err) { return jsonResp({ error: String(err) }, 500); }
+    try {
+      await ws.rm(filePath);
+      writeLog(env, ctx, "info", "admin.files.delete", { workspace: wsName, path: filePath });
+    } catch (err) {
+      writeLog(env, ctx, "error", "admin.files.delete.error", { workspace: wsName, path: filePath, error: String(err) });
+      return jsonResp({ error: String(err) }, 500);
+    }
     return jsonResp({ deleted: filePath });
   }
 
+  writeLog(env, ctx, "warn", "admin.api.not_found", { method, path });
   return jsonResp({ error: "Not found" }, 404);
 }
 
@@ -662,6 +840,11 @@ tr:hover td{background:var(--cf-bg-hover)}
         <svg class="nav-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 3.5A1.5 1.5 0 0 1 3.5 2H7l2 2h3.5A1.5 1.5 0 0 1 14 5.5v7A1.5 1.5 0 0 1 12.5 14h-9A1.5 1.5 0 0 1 2 12.5v-9z"/></svg>
         <span>Files</span>
       </div>
+      <div class="nav-item" data-sec="logs">
+        <span class="nav-num">04</span>
+        <svg class="nav-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="2" width="12" height="12" rx="1.5"/><path d="M5 5h6M5 8h6M5 11h4"/></svg>
+        <span>Logs</span>
+      </div>
     </nav>
   </aside>
   <main id="main">
@@ -731,17 +914,38 @@ tr:hover td{background:var(--cf-bg-hover)}
         </div>
       </div>
     </div>
+
+    <!-- 04 Logs -->
+    <div id="sec-logs" class="section">
+      <div class="sec-title">Logs</div>
+      <div class="sec-sub">Structured Worker events stored in KV (7-day TTL). All entries also appear in <strong>Cloudflare Workers Observability</strong> and <code style="font-family:monospace;font-size:11px;background:rgba(235,213,193,.4);padding:1px 5px;border-radius:3px">wrangler tail</code>.</div>
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px;flex-wrap:wrap">
+        <div id="log-filter" style="display:flex;gap:6px">
+          <button class="sm active-filter" data-lvl="all">All</button>
+          <button class="sm" data-lvl="error" style="color:var(--cf-error);border-color:rgba(220,38,38,.3)">Errors</button>
+          <button class="sm" data-lvl="warn"  style="color:#b45309;border-color:rgba(180,83,9,.3)">Warnings</button>
+          <button class="sm" data-lvl="info">Info</button>
+        </div>
+        <button class="sm primary" id="refresh-logs-btn">&#8635; Refresh</button>
+        <span id="log-count" style="font-size:11px;color:var(--cf-text-muted);margin-left:auto"></span>
+      </div>
+      <div class="card" style="overflow:hidden">
+        <div id="logs-body"><div class="empty">Loading&hellip;</div></div>
+      </div>
+    </div>
+
   </main>
 </div></div>
 <div class="toast" id="toast"></div>
 <script>
 var ADMIN_KEY='',BASE=window.location.origin,bWs='shared',bPath='/',bFiles=[];
+var logLevel='all',logTimer=null;
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 function toast(msg,ok){var el=document.getElementById('toast');el.textContent=msg;el.style.background=(ok===false)?'var(--cf-error)':'var(--cf-text)';el.classList.add('show');setTimeout(function(){el.classList.remove('show');},2500);}
 async function api(path,opts){opts=opts||{};var h=Object.assign({'X-Admin-Key':ADMIN_KEY},opts.headers||{});var res=await fetch(BASE+'/admin/api'+path,Object.assign({},opts,{headers:h}));if(res.status===401){showAuth();return null;}return res;}
 async function authenticate(){var key=document.getElementById('admin-key').value.trim();if(!key)return;ADMIN_KEY=key;var res=await api('/users');if(!res){document.getElementById('auth-error').style.display='block';ADMIN_KEY='';return;}sessionStorage.setItem('adminKey',key);document.getElementById('auth-overlay').style.display='none';document.getElementById('app').style.display='block';renderUsers(await res.json());}
 function showAuth(){sessionStorage.removeItem('adminKey');document.getElementById('auth-overlay').style.display='flex';document.getElementById('app').style.display='none';}
-function showSection(name){document.querySelectorAll('.section').forEach(function(el){el.classList.remove('active');});document.getElementById('sec-'+name).classList.add('active');document.querySelectorAll('.nav-item').forEach(function(el){el.classList.remove('active');});document.querySelector('[data-sec="'+name+'"]').classList.add('active');if(name==='tools')loadTools();if(name==='files')populateWsSel();}
+function showSection(name){document.querySelectorAll('.section').forEach(function(el){el.classList.remove('active');});document.getElementById('sec-'+name).classList.add('active');document.querySelectorAll('.nav-item').forEach(function(el){el.classList.remove('active');});document.querySelector('[data-sec="'+name+'"]').classList.add('active');if(name==='tools')loadTools();if(name==='files')populateWsSel();if(name==='logs'){loadLogs();if(!logTimer)logTimer=setInterval(loadLogs,30000);}else{if(logTimer){clearInterval(logTimer);logTimer=null;}}}
 document.getElementById('nav').addEventListener('click',function(e){var item=e.target.closest('.nav-item');if(item)showSection(item.dataset.sec);});
 async function loadUsers(){var res=await api('/users');if(!res)return;renderUsers(await res.json());}
 function renderUsers(users){document.getElementById('user-count').textContent=users.length+' users';if(!users.length){document.getElementById('users-body').innerHTML='<div class="empty">No users yet.</div>';return;}var rows='';users.forEach(function(u){rows+='<tr><td><strong>'+esc(u.name)+'</strong></td><td style="font-family:monospace;font-size:12px">'+esc(u.email)+'</td><td>'+new Date(u.createdAt).toLocaleDateString()+'</td><td><span class="badge '+(u.fileCount>0?'badge-g':'badge-m')+'">'+u.fileCount+' files</span></td><td style="white-space:nowrap"><button class="sm" data-action="browse" data-email="'+esc(u.email)+'">Browse</button> <button class="sm danger" data-action="wipe" data-email="'+esc(u.email)+'">Wipe</button> <button class="sm danger" data-action="remove" data-email="'+esc(u.email)+'">Remove</button></td></tr>';});document.getElementById('users-body').innerHTML='<table><thead><tr><th>Name</th><th>Email</th><th>First Login</th><th>Workspace</th><th>Actions</th></tr></thead><tbody>'+rows+'</tbody></table>';}
@@ -769,7 +973,47 @@ document.getElementById('ws-sel').addEventListener('change',function(){bWs=this.
 window.addEventListener('load',function(){var s=sessionStorage.getItem('adminKey');if(s){document.getElementById('admin-key').value=s;authenticate();}});
 document.getElementById('admin-key').addEventListener('keydown',function(e){if(e.key==='Enter')authenticate();});
 document.getElementById('unlock-btn').addEventListener('click',authenticate);
+
+/* ── 04 Logs ── */
+var LOG_LEVEL_COLORS={info:'var(--cf-text-muted)',warn:'#b45309',error:'var(--cf-error)'};
+var LOG_LEVEL_BG={info:'rgba(235,213,193,.3)',warn:'rgba(180,83,9,.08)',error:'rgba(220,38,38,.08)'};
+async function loadLogs(){
+  document.getElementById('log-count').textContent='Loading\u2026';
+  var res=await api('/logs?limit=200&level='+logLevel);
+  if(!res)return;
+  var logs=await res.json();
+  renderLogs(logs);
+}
+function renderLogs(logs){
+  document.getElementById('log-count').textContent=logs.length+' entries';
+  if(!logs.length){document.getElementById('logs-body').innerHTML='<div class="empty">No log entries yet. Actions in the admin panel will appear here.</div>';return;}
+  var html='<table style="font-size:12px"><thead><tr><th style="width:170px">Time</th><th style="width:60px">Level</th><th style="width:200px">Event</th><th>Data</th></tr></thead><tbody>';
+  logs.forEach(function(l){
+    var d=new Date(l.ts);
+    var ts=d.toLocaleDateString()+' '+d.toLocaleTimeString();
+    var dataStr=Object.keys(l.data||{}).length?JSON.stringify(l.data):'';
+    html+='<tr style="background:'+LOG_LEVEL_BG[l.level||\'info\']+'">'
+      +'<td style="font-family:monospace;font-size:11px;color:var(--cf-text-muted);white-space:nowrap">'+esc(ts)+'</td>'
+      +'<td><span style="font-size:10px;font-weight:700;text-transform:uppercase;color:'+LOG_LEVEL_COLORS[l.level||\'info\']+'">'+esc(l.level||'info')+'</span></td>'
+      +'<td style="font-family:monospace;font-size:11px">'+esc(l.event||'')+'</td>'
+      +'<td style="font-family:monospace;font-size:11px;color:var(--cf-text-muted);word-break:break-all">'+esc(dataStr)+'</td>'
+      +'</tr>';
+  });
+  html+='</tbody></table>';
+  document.getElementById('logs-body').innerHTML=html;
+}
+document.getElementById('log-filter').addEventListener('click',function(e){
+  var btn=e.target.closest('button[data-lvl]');if(!btn)return;
+  logLevel=btn.dataset.lvl;
+  document.querySelectorAll('#log-filter button').forEach(function(b){b.classList.remove('active-filter');b.style.fontWeight='';});
+  btn.classList.add('active-filter');btn.style.fontWeight='600';
+  loadLogs();
+});
+document.getElementById('refresh-logs-btn').addEventListener('click',loadLogs);
 </script>
+<style>
+.active-filter{font-weight:600!important;border-style:solid!important;background:var(--cf-bg-hover)!important;color:var(--cf-text)!important}
+</style>
 </body>
 </html>`;
   return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });

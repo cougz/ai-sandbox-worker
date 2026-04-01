@@ -318,14 +318,17 @@ export class SandboxAgent extends McpAgent<Env, Record<string, never>, Props> {
           optional:    z.boolean().optional(),
         })).optional().describe("Parameter schema — omit or pass {} for tools with no arguments"),
         code: z.string().describe("Async arrow function, e.g. async ({ arg1, arg2 }) => { ... }"),
+        global: z.boolean().optional().describe("Save to shared workspace (visible to all users) — default false (personal workspace)"),
       },
-      async ({ name, description, schema, code }) => {
+      async ({ name, description, schema, code, global }) => {
         const def: UserToolDef = { name, description, schema: schema ?? {}, code };
         const path = `/tools/${name}/tool.json`;
-        await this.workspace.writeFile(path, JSON.stringify(def, null, 2));
+        const targetWs = global ? this.sharedWorkspace : this.workspace;
+        await targetWs.writeFile(path, JSON.stringify(def, null, 2));
         this.registerUserTool(def);
+        const location = global ? "Shared Workspace (global)" : "Personal Workspace";
         return {
-          content: [{ type: "text" as const, text: `Tool '${name}' saved to ${path} and registered in this session.` }],
+          content: [{ type: "text" as const, text: `Tool '${name}' saved to ${path} in ${location} and registered in this session.` }],
         };
       }
     );

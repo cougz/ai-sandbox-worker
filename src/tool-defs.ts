@@ -122,9 +122,12 @@ export function buildBuiltinToolDefs(domainToolNames: string[]): ToolDef[] {
     {
       name: "tool_create",
       description: [
-        "Create or update a reusable custom MCP tool in your personal workspace.",
+        "Create or update a reusable custom MCP tool in your personal or shared workspace.",
         "The tool is saved to /tools/{name}/tool.json and registered immediately in this session.",
         "It will be auto-loaded at the start of every future session.",
+        "",
+        "Set global=true to save to the Shared Workspace (visible to all users and shown in the Admin Panel).",
+        "Default is false (Personal Workspace — only visible to you).",
         "",
         "Tool layout (directory format — new standard):",
         "  /tools/{name}/tool.json   ← required: tool definition (this file)",
@@ -152,6 +155,7 @@ export function buildBuiltinToolDefs(domainToolNames: string[]): ToolDef[] {
         { name: "description", type: "string", description: "What the tool does — shown to the AI in every session", required: true },
         { name: "schema", type: "object", description: "Parameter schema — omit or pass {} for tools with no arguments", required: false },
         { name: "code", type: "string", description: "Async arrow function, e.g. async ({ arg1, arg2 }) => { ... }", required: true },
+        { name: "global", type: "boolean", description: "Save to shared workspace (visible to all users) — default false (personal workspace)", required: false },
       ],
     },
 

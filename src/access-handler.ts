@@ -1013,7 +1013,7 @@ function toolCard(t,type){
   var actions=params.length?'<button class="sm param-toggle" style="margin-left:auto">Params &#9656;</button>':'<span style="margin-left:auto"></span>';
   if(type==='custom'){
     if(t._files&&t._files.length){
-      var toolDir=t._files[0].replace(/\/[^/]+$/,'');
+      var toolDir=t._files[0].substring(0,t._files[0].lastIndexOf('/'));
       actions+=' <button class="sm files-toggle">Files &#9656;</button>';
       actions+=' <button class="sm" data-browse-tool="'+esc(t.name)+'" data-browse-dir="'+esc(toolDir)+'">Browse</button>';
     }

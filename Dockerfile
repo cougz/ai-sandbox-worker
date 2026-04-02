@@ -1,26 +1,18 @@
-FROM ubuntu:24.04
+# The cloudflare/sandbox base image ships the container agent that handles
+# /ws/pty (terminal), /exec, /files, etc. on port 3000.
+# The -python variant includes Python 3, pip, and Node.js out of the box.
+FROM docker.io/cloudflare/sandbox:latest-python
 
-ENV DEBIAN_FRONTEND=noninteractive
-
+# Extra tools useful in the interactive terminal
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    bash \
-    curl \
-    wget \
-    git \
     vim \
     nano \
-    python3 \
-    python3-pip \
-    python3-venv \
-    nodejs \
-    npm \
     jq \
     htop \
-    procps \
     net-tools \
     iputils-ping \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace
 
-CMD ["/bin/bash"]
+EXPOSE 8080

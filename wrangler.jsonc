@@ -30,9 +30,8 @@
   ],
 
   "vars": {
-    "PUBLIC_URL": "https://ai-sandbox.cloudemo.org"
-    // ADMIN_EMAILS should be configured via Cloudflare Dashboard (Settings → Variables)
-    // or via: wrangler vars put ADMIN_EMAILS
+    "PUBLIC_URL": "https://ai-sandbox.cloudemo.org",
+    "ADMIN_EMAILS": "tim.seiffert@cloudflare.com"
   },
 
   // Secrets — set after deploy:

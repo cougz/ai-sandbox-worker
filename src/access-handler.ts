@@ -1257,11 +1257,15 @@ async function initTerminal(){
   var container=document.getElementById('xterm-mount');
   if(!container)return;
   try{
+    // Use the official SandboxAddon — same implementation as sandbox-sdk.site.
+    // It manages the WebSocket, binary encoding, resize, ready/exit/error messages
+    // and automatic reconnection after a session ends (e.g. after typing "exit").
     var mods=await Promise.all([
       import('https://esm.sh/@xterm/xterm@5'),
-      import('https://esm.sh/@xterm/addon-fit@0.10.0')
+      import('https://esm.sh/@xterm/addon-fit@0.10.0'),
+      import('https://esm.sh/@cloudflare/sandbox@0.8.4/xterm')
     ]);
-    var Terminal=mods[0].Terminal,FitAddon=mods[1].FitAddon;
+    var Terminal=mods[0].Terminal,FitAddon=mods[1].FitAddon,SandboxAddon=mods[2].SandboxAddon;
     var term=new Terminal({
       fontFamily:"ui-monospace,'Cascadia Code','Source Code Pro',Menlo,monospace",
       fontSize:13,lineHeight:1.4,cursorBlink:true,cursorStyle:'bar',allowProposedApi:true,
@@ -1277,71 +1281,33 @@ async function initTerminal(){
     });
     termInstance=term;
     var fit=new FitAddon();
+    var addon=new SandboxAddon({
+      getWebSocketUrl:function(o){
+        // Server derives the sandbox ID from the session cookie — ignore o.sandboxId
+        return o.origin+'/dash/ws/terminal';
+      },
+      onStateChange:function(state,err){
+        if(state==='connected'){
+          var c=document.getElementById('terminal-connecting');
+          if(c)c.style.display='none';
+        }
+        if(err)term.write('\\r\\n['+err.message+']\\r\\n');
+      }
+    });
     term.loadAddon(fit);
+    term.loadAddon(addon);
     term.open(container);
     fit.fit();
-    var enc=new TextEncoder();
-    // Intercept Ctrl+A…Ctrl+Z BEFORE the browser gets a chance to act on them
-    // (Ctrl+C = copy, Ctrl+D = close tab, etc.).  Return false so xterm does
-    // not also fire onData for the same keystroke.
-    term.attachCustomKeyEventHandler(function(e){
-      if(e.type==='keydown'&&e.ctrlKey&&!e.shiftKey&&!e.altKey&&!e.metaKey&&e.key.length===1){
-        var code=e.key.toLowerCase().charCodeAt(0)-96;
-        if(code>=1&&code<=26){
-          if(termWs&&termWs.readyState===1)termWs.send(enc.encode(String.fromCharCode(code)));
-          return false;
-        }
-      }
-      return true;
-    });
-    var resizeObs=new ResizeObserver(function(){fit.fit();});
-    resizeObs.observe(container);
-    // Connect WebSocket — cookies are sent automatically (session auth)
-    var proto=location.protocol==='https:'?'wss:':'ws:';
-    var ws=new WebSocket(proto+'//'+location.host+'/dash/ws/terminal');
-    termWs=ws;
-    ws.binaryType='arraybuffer';
-    // onopen: just register input handlers — wait for {type:"ready"} to show terminal
-    ws.onopen=function(){
-      term.onData(function(data){
-        // Container agent expects binary frames for keystroke input
-        if(ws.readyState===1)ws.send(enc.encode(data));
-      });
-      term.onResize(function(sz){
-        // Resize messages are JSON control frames
-        if(ws.readyState===1)try{ws.send(JSON.stringify({type:'resize',cols:sz.cols,rows:sz.rows}));}catch(e){}
-      });
-    };
-    ws.onmessage=function(e){
-      if(e.data instanceof ArrayBuffer){term.write(new Uint8Array(e.data));return;}
-      try{
-        var msg=JSON.parse(e.data);
-        if(msg.type==='ready'){
-          // Container is ready: hide overlay, send current terminal size
-          var conn=document.getElementById('terminal-connecting');
-          if(conn)conn.style.display='none';
-          if(ws.readyState===1)ws.send(JSON.stringify({type:'resize',cols:term.cols,rows:term.rows}));
-          term.focus();
-        }else if(msg.type==='error'){
-          term.write('\\r\\n[error] '+(msg.message||'unknown')+'\\r\\n');
-        }else if(msg.type==='exit'){
-          term.write('\\r\\n[session exited with code '+(msg.code||0)+']\\r\\n');
-        }
-      }catch(e2){}
-    };
-    ws.onclose=function(){term.write('\\r\\n[connection closed — refresh to reconnect]\\r\\n');};
-    ws.onerror=function(){
-      var conn=document.getElementById('terminal-connecting');
-      if(conn)conn.style.display='none';
-      term.write('\\r\\n[websocket error]\\r\\n');
-    };
-    // Render demo command buttons
+    new ResizeObserver(function(){fit.fit();}).observe(container);
+    // sandboxId is ignored server-side (derived from session cookie)
+    addon.connect({sandboxId:'session'});
+    // Demo command buttons — SandboxAddon.sendData handles binary encoding
     var btnsEl=document.getElementById('term-cmds');
     if(btnsEl){
       TERM_CMDS.forEach(function(c){
         var btn=document.createElement('button');
         btn.textContent=c.label;
-        btn.addEventListener('click',function(){if(ws.readyState===1){ws.send(enc.encode(c.cmd));term.focus();}});
+        btn.addEventListener('click',function(){addon.sendData(c.cmd);term.focus();});
         btnsEl.appendChild(btn);
       });
     }

@@ -1,6 +1,9 @@
 import OAuthProvider from "@cloudflare/workers-oauth-provider";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
+// Re-export Sandbox DO class — required for the container Durable Object binding
+export { Sandbox } from "@cloudflare/sandbox";
+
 import { McpAgent } from "agents/mcp";
 import { DynamicWorkerExecutor, resolveProvider } from "@cloudflare/codemode";
 import { Workspace } from "@cloudflare/shell";
@@ -19,6 +22,7 @@ export interface Env {
   LOADER: WorkerLoader;
   SandboxAgent: DurableObjectNamespace;
   MCP_OBJECT: DurableObjectNamespace;   // alias for SandboxAgent — required by OAuthProvider
+  Sandbox: DurableObjectNamespace;      // container-backed DO for the /dash terminal
   STORAGE?: R2Bucket;
   USER_REGISTRY: KVNamespace;
   OAUTH_KV: KVNamespace;

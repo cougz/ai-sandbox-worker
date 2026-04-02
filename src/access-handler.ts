@@ -1,5 +1,6 @@
 import { Buffer } from "node:buffer";
 import type { AuthRequest, OAuthHelpers } from "@cloudflare/workers-oauth-provider";
+import { getSandbox } from "@cloudflare/sandbox";
 import { Workspace } from "@cloudflare/shell";
 import {
   addApprovedClient,
@@ -158,6 +159,22 @@ export async function handleRequest(
     });
 
     return Response.redirect(redirectTo, 302);
+  }
+
+  // ── WebSocket: interactive terminal for /dash ─────────────────────────────
+  // The browser sends the __Host-DASH_SESSION cookie automatically; we
+  // authenticate from that session before proxying to the container sandbox.
+  if (pathname === "/ws/terminal") {
+    if (request.headers.get("Upgrade") !== "websocket") {
+      return new Response("WebSocket upgrade required", { status: 426 });
+    }
+    const user = await authenticateRequest(request, env);
+    if (!user) return new Response("Unauthorized", { status: 401 });
+    // Per-user sandbox — stable ID derived from the authenticated email.
+    const sandboxId = `dash-terminal-${emailToNamespace(user.email)}`;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sb = getSandbox((env as any).Sandbox, sandboxId) as any;
+    return await sb.terminal(request, { cols: 220, rows: 50 });
   }
 
   // ── Public: serve a workspace file ───────────────────────────────────────
@@ -855,6 +872,7 @@ function serveDashboard(user: AuthenticatedUser, sessionCookie: string): Respons
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>AI Sandbox — Dashboard</title>
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA2NiA2NiI+PHJlY3Qgd2lkdGg9IjY2IiBoZWlnaHQ9IjY2IiByeD0iOSIgZmlsbD0iI0ZGNDgwMSIvPjxnIHRyYW5zZm9ybT0idHJhbnNsYXRlKDAsMTgpIiBmaWxsPSJ3aGl0ZSI+PHBhdGggZD0iTTUyLjY4OCAxMy4wMjhjLS4yMiAwLS40MzcuMDA4LS42NTQuMDE1YS4zLjMgMCAwIDAtLjEwMi4wMjQuMzcuMzcgMCAwIDAtLjIzNi4yNTVsLS45MyAzLjI0OWMtLjQwMSAxLjM5Ny0uMjUyIDIuNjg3LjQyMiAzLjYzNC42MTguODc2IDEuNjQ2IDEuMzkgMi44OTQgMS40NWw1LjA0NS4zMDZhLjQ1LjQ1IDAgMCAxIC40MzUuNDEuNS41IDAgMCAxLS4wMjUuMjIzLjY0LjY0IDAgMCAxLS41NDcuNDI2bC01LjI0Mi4zMDZjLTIuODQ4LjEzMi01LjkxMiAyLjQ1Ni02Ljk4NyA1LjI5bC0uMzc4IDFhLjI4LjI4IDAgMCAwIC4yNDguMzgyaDE4LjA1NGEuNDguNDggMCAwIDAgLjQ2NC0uMzVjLjMyLTEuMTUzLjQ4Mi0yLjM0NC40OC0zLjU0IDAtNy4yMi01Ljc5LTEzLjA3Mi0xMi45MzMtMTMuMDcyTTQ0LjgwNyAyOS41NzhsLjMzNC0xLjE3NWMuNDAyLTEuMzk3LjI1My0yLjY4Ny0uNDItMy42MzQtLjYyLS44NzYtMS42NDctMS4zOS0yLjg5Ni0xLjQ1bC0yMy42NjUtLjMwNmEuNDcuNDcgMCAwIDEtLjM3NC0uMTk5LjUuNSAwIDAgMS0uMDUyLS40MzQuNjQuNjQgMCAwIDEgLjU1Mi0uNDI2bDIzLjg4Ni0uMzA2YzIuODM2LS4xMzEgNS45LTIuNDU2IDYuOTc1LTUuMjlsMS4zNjItMy42YS45LjkgMCAwIDAgLjA0LS40NzdDNDguOTk3IDUuMjU5IDQyLjc4OSAwIDM1LjM2NyAwYy02Ljg0MiAwLTEyLjY0NyA0LjQ2Mi0xNC43MyAxMC42NjVhNi45MiA2LjkyIDAgMCAwLTQuOTExLTEuMzc0Yy0zLjI4LjMzLTUuOTIgMy4wMDItNi4yNDYgNi4zMThhNy4yIDcuMiAwIDAgMCAuMTggMi40NzJDNC4zIDE4LjI0MSAwIDIyLjY3OSAwIDI4LjEzM3EwIC43NC4xMDYgMS40NTNhLjQ2LjQ2IDAgMCAwIC40NTcuNDAyaDQzLjcwNGEuNTcuNTcgMCAwIDAgLjU0LS40MTgiLz48L2c+PC9zdmc+">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5/css/xterm.css">
 <style>
 html{color-scheme:light}*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{--cf-orange:#FF4801;--cf-text:#521000;--cf-text-muted:rgba(82,16,0,.7);--cf-text-subtle:rgba(82,16,0,.4);--cf-bg:#FFFBF5;--cf-bg-card:#FFFDFB;--cf-bg-hover:#FEF7ED;--cf-border:#EBD5C1;--cf-success:#16A34A;--cf-error:#DC2626}
@@ -1034,6 +1052,25 @@ tr:hover td{background:var(--cf-bg-hover)}
       </div>
     </div>
 
+    <div id="sec-terminal" class="section">
+      <div class="sec-title">Interactive Terminal</div>
+      <div class="sec-sub">Full interactive terminal session connected to a dedicated sandbox container via WebSocket. Supports tab completion, history, colors, and all PTY features.</div>
+      <div style="background:#160a00;border:1px solid var(--cf-border);border-radius:4px;padding:4px;position:relative">
+        <div id="terminal-connecting" style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:14px;background:rgba(22,10,0,.94);z-index:10;border-radius:4px">
+          <div style="display:flex;align-items:flex-end;gap:3px;height:24px">
+            <div class="sig-bar" style="--d:0;width:3px;border-radius:2px;background:var(--cf-orange)"></div>
+            <div class="sig-bar" style="--d:1;width:3px;border-radius:2px;background:var(--cf-orange)"></div>
+            <div class="sig-bar" style="--d:2;width:3px;border-radius:2px;background:var(--cf-orange)"></div>
+            <div class="sig-bar" style="--d:3;width:3px;border-radius:2px;background:var(--cf-orange)"></div>
+            <div class="sig-bar" style="--d:4;width:3px;border-radius:2px;background:var(--cf-orange)"></div>
+          </div>
+          <span style="font-size:13px;font-weight:500;color:rgba(245,230,211,.7)">Connecting to sandbox&hellip;</span>
+        </div>
+        <div id="xterm-mount" style="height:440px"></div>
+      </div>
+      <div id="term-cmds" style="display:flex;flex-wrap:wrap;gap:8px;margin-top:12px"></div>
+    </div>
+
     <div id="sec-account" class="section">
       <div class="sec-title">My Account</div>
       <div class="sec-sub">Your workspace and account information.</div>
@@ -1077,6 +1114,7 @@ var ICONS={
   tools:'<path d="M2 4h12M2 8h12M2 12h12"/><circle cx="5" cy="4" r="1.5"/><circle cx="11" cy="8" r="1.5"/><circle cx="7" cy="12" r="1.5"/>',
   files:'<path d="M1.5 5A1.5 1.5 0 013 3.5h4L8.5 5H13A1.5 1.5 0 0114.5 6.5v6A1.5 1.5 0 0113 14H3a1.5 1.5 0 01-1.5-1.5z"/>',
   logs:'<rect x="2.5" y="1.5" width="11" height="13" rx="1.5"/><path d="M5 5.5h6M5 8h6M5 10.5h3.5"/>',
+  terminal:'<polyline points="3 6 7 10 3 14"/><line x1="9" y1="14" x2="14" y2="14"/>',
   account:'<circle cx="8" cy="5.5" r="2.5"/><path d="M3 14c0-2.8 2.2-5 5-5s5 2.2 5 5"/>'
 };
 var navItems=IS_ADMIN?[
@@ -1084,10 +1122,12 @@ var navItems=IS_ADMIN?[
   {id:'tools',label:'Tools',svg:ICONS.tools},
   {id:'files',label:'Files',svg:ICONS.files},
   {id:'logs',label:'Logs',svg:ICONS.logs},
+  {id:'terminal',label:'Terminal',svg:ICONS.terminal},
   {id:'account',label:'My Account',svg:ICONS.account}
 ]:[
   {id:'tools',label:'Tools',svg:ICONS.tools},
   {id:'files',label:'Files',svg:ICONS.files},
+  {id:'terminal',label:'Terminal',svg:ICONS.terminal},
   {id:'account',label:'My Account',svg:ICONS.account}
 ];
 
@@ -1101,7 +1141,7 @@ function buildNav(){
   });
 }
 
-function showSection(name){document.querySelectorAll('.section').forEach(function(el){el.classList.remove('active');});document.getElementById('sec-'+name).classList.add('active');document.querySelectorAll('.nav-item').forEach(function(el){el.classList.remove('active');});var navItem=document.querySelector('[data-sec="'+name+'"]');if(navItem)navItem.classList.add('active');if(name==='users')loadUsers();if(name==='tools')loadTools();if(name==='files'){if(IS_ADMIN)populateWsSel(bWs).then(loadBrowserFiles);else{bWs=USER_EMAIL;loadBrowserFiles();}}if(name==='logs'){loadLogs();if(!logTimer)logTimer=setInterval(loadLogs,30000);}else{if(logTimer){clearInterval(logTimer);logTimer=null;}}if(name==='account')loadAccount();}
+function showSection(name){document.querySelectorAll('.section').forEach(function(el){el.classList.remove('active');});document.getElementById('sec-'+name).classList.add('active');document.querySelectorAll('.nav-item').forEach(function(el){el.classList.remove('active');});var navItem=document.querySelector('[data-sec="'+name+'"]');if(navItem)navItem.classList.add('active');if(name==='users')loadUsers();if(name==='tools')loadTools();if(name==='files'){if(IS_ADMIN)populateWsSel(bWs).then(loadBrowserFiles);else{bWs=USER_EMAIL;loadBrowserFiles();}}if(name==='logs'){loadLogs();if(!logTimer)logTimer=setInterval(loadLogs,30000);}else{if(logTimer){clearInterval(logTimer);logTimer=null;}}if(name==='account')loadAccount();if(name==='terminal')initTerminal();}
 
 document.getElementById('nav').addEventListener('click',function(e){var item=e.target.closest('.nav-item');if(item)showSection(item.dataset.sec);});
 
@@ -1199,11 +1239,96 @@ document.getElementById('refresh-logs-btn').addEventListener('click',loadLogs);
 /* ── 05 My Account ── */
 async function loadAccount(){var res=await api('/me');if(!res)return;var data=await res.json();document.getElementById('account-email').textContent=data.email;document.getElementById('account-name').textContent=data.name;document.getElementById('account-created').textContent=new Date(data.createdAt).toLocaleDateString();document.getElementById('account-files').textContent=data.fileCount+' files';}
 
+/* ── Terminal ── */
+var termInited=false,termWs=null,termInstance=null;
+var TERM_CMDS=[
+  {label:'System info',cmd:'uname -a\r'},
+  {label:'Python version',cmd:'python3 --version\r'},
+  {label:'Node version',cmd:'node --version\r'},
+  {label:'List /workspace',cmd:'ls -la /workspace\r'},
+  {label:'Disk usage',cmd:'df -h /\r'},
+  {label:'Cowsay',cmd:'pip3 install cowsay -q && python3 -c \'import cowsay; cowsay.cow("Hello!")\'\r'},
+  {label:'Fetch URL',cmd:'node -e "fetch(\'https://httpbin.org/ip\').then(r=>r.json()).then(console.log)"\r'},
+  {label:'Write & run Python',cmd:'echo \'import math; print(f"Pi = {math.pi:.10f}")\' > /tmp/demo.py && python3 /tmp/demo.py\r'}
+];
+async function initTerminal(){
+  if(termInited)return;
+  termInited=true;
+  var container=document.getElementById('xterm-mount');
+  if(!container)return;
+  try{
+    var mods=await Promise.all([
+      import('https://esm.sh/@xterm/xterm@5'),
+      import('https://esm.sh/@xterm/addon-fit@0.10.0')
+    ]);
+    var Terminal=mods[0].Terminal,FitAddon=mods[1].FitAddon;
+    var term=new Terminal({
+      fontFamily:"ui-monospace,'Cascadia Code','Source Code Pro',Menlo,monospace",
+      fontSize:13,lineHeight:1.4,cursorBlink:true,cursorStyle:'bar',allowProposedApi:true,
+      theme:{
+        background:'#160a00',foreground:'#f5e6d3',cursor:'#FF4801',cursorAccent:'#160a00',
+        selectionBackground:'rgba(255,72,1,0.3)',
+        black:'#1a0800',red:'#dc2626',green:'#16a34a',yellow:'#eab308',
+        blue:'#2563eb',magenta:'#9616ff',cyan:'#06b6d4',white:'#f5e6d3',
+        brightBlack:'#6b3a1f',brightRed:'#ef4444',brightGreen:'#22c55e',
+        brightYellow:'#facc15',brightBlue:'#3b82f6',brightMagenta:'#a855f7',
+        brightCyan:'#22d3ee',brightWhite:'#ffffff'
+      }
+    });
+    termInstance=term;
+    var fit=new FitAddon();
+    term.loadAddon(fit);
+    term.open(container);
+    fit.fit();
+    var resizeObs=new ResizeObserver(function(){fit.fit();});
+    resizeObs.observe(container);
+    // Connect WebSocket — cookies are sent automatically (session auth)
+    var proto=location.protocol==='https:'?'wss:':'ws:';
+    var ws=new WebSocket(proto+'//'+location.host+'/ws/terminal');
+    termWs=ws;
+    ws.binaryType='arraybuffer';
+    ws.onopen=function(){
+      var conn=document.getElementById('terminal-connecting');
+      if(conn)conn.style.display='none';
+    };
+    ws.onmessage=function(e){
+      if(e.data instanceof ArrayBuffer)term.write(new Uint8Array(e.data));
+      else term.write(e.data);
+    };
+    ws.onclose=function(){term.write('\r\n\x1b[31mConnection closed.\x1b[0m\r\n');};
+    ws.onerror=function(){
+      var conn=document.getElementById('terminal-connecting');
+      if(conn)conn.style.display='none';
+      term.write('\r\n\x1b[31mWebSocket error — check that the Sandbox binding is configured.\x1b[0m\r\n');
+    };
+    term.onData(function(data){if(ws.readyState===1)ws.send(data);});
+    term.onResize(function(sz){
+      if(ws.readyState===1){try{ws.send(JSON.stringify({type:'resize',cols:sz.cols,rows:sz.rows}));}catch(e){}}
+    });
+    // Render demo command buttons
+    var btnsEl=document.getElementById('term-cmds');
+    if(btnsEl){
+      TERM_CMDS.forEach(function(c){
+        var btn=document.createElement('button');
+        btn.textContent=c.label;
+        btn.addEventListener('click',function(){if(ws.readyState===1){ws.send(c.cmd);term.focus();}});
+        btnsEl.appendChild(btn);
+      });
+    }
+  }catch(err){
+    var conn=document.getElementById('terminal-connecting');
+    if(conn)conn.innerHTML='<span style="color:rgba(245,100,60,.8);font-size:13px">Failed to load terminal: '+esc(String(err))+'</span>';
+  }
+}
+
 /* ── Init ── */
 window.addEventListener('load',function(){buildNav();showSection(navItems[0].id);});
 </script>
 <style>
 .active-filter{font-weight:600!important;border-style:solid!important;background:var(--cf-bg-hover)!important;color:var(--cf-text)!important}
+@keyframes sig{0%,100%{opacity:.3;transform:scaleY(.5)}50%{opacity:1;transform:scaleY(1)}}
+.sig-bar{animation:sig 1s ease-in-out infinite;transform-origin:bottom;animation-delay:calc(var(--d)*0.12s)}
+.sig-bar:nth-child(1){height:10px}.sig-bar:nth-child(2){height:13px}.sig-bar:nth-child(3){height:16px}.sig-bar:nth-child(4){height:19px}.sig-bar:nth-child(5){height:22px}
 </style>
 </body>
 </html>`;

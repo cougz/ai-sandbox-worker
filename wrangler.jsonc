@@ -10,10 +10,24 @@
   "durable_objects": {
     "bindings": [
       { "name": "SandboxAgent", "class_name": "SandboxAgent" },
-      { "name": "MCP_OBJECT",   "class_name": "SandboxAgent" }
+      { "name": "MCP_OBJECT",   "class_name": "SandboxAgent" },
+      { "name": "Sandbox",      "class_name": "Sandbox" }
     ]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["SandboxAgent"] }],
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["SandboxAgent"] },
+    { "tag": "v2", "new_sqlite_classes": ["Sandbox"] }
+  ],
+
+  // Cloudflare Container backing the interactive terminal in /dash
+  "containers": [
+    {
+      "class_name": "Sandbox",
+      "image": "./Dockerfile",
+      "instance_type": "lite",
+      "max_instances": 50
+    }
+  ],
 
   // OAUTH_KV and USER_REGISTRY share the same namespace — key prefixes don't collide
   // (oauth:* for OAuth state, user:* for admin registry)

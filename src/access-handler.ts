@@ -1242,14 +1242,14 @@ async function loadAccount(){var res=await api('/me');if(!res)return;var data=aw
 /* ── Terminal ── */
 var termInited=false,termWs=null,termInstance=null;
 var TERM_CMDS=[
-  {label:'System info',cmd:'uname -a\r'},
-  {label:'Python version',cmd:'python3 --version\r'},
-  {label:'Node version',cmd:'node --version\r'},
-  {label:'List /workspace',cmd:'ls -la /workspace\r'},
-  {label:'Disk usage',cmd:'df -h /\r'},
-  {label:'Cowsay',cmd:'pip3 install cowsay -q && python3 -c \'import cowsay; cowsay.cow("Hello!")\'\r'},
-  {label:'Fetch URL',cmd:'node -e "fetch(\'https://httpbin.org/ip\').then(r=>r.json()).then(console.log)"\r'},
-  {label:'Write & run Python',cmd:'echo \'import math; print(f"Pi = {math.pi:.10f}")\' > /tmp/demo.py && python3 /tmp/demo.py\r'}
+  {label:'System info',cmd:'uname -a\\r'},
+  {label:'Python version',cmd:'python3 --version\\r'},
+  {label:'Node version',cmd:'node --version\\r'},
+  {label:'List /workspace',cmd:'ls -la /workspace\\r'},
+  {label:'Disk usage',cmd:'df -h /\\r'},
+  {label:'Cowsay',cmd:'pip3 install cowsay -q && python3 -c \\'import cowsay; cowsay.cow("Hello!")\\' \\r'},
+  {label:'Fetch URL',cmd:'node -e "fetch(\\'https://httpbin.org/ip\\').then(r=>r.json()).then(console.log)"\\r'},
+  {label:'Write & run Python',cmd:'echo \\'import math; print(math.pi)\\' > /tmp/demo.py && python3 /tmp/demo.py\\r'}
 ];
 async function initTerminal(){
   if(termInited)return;
@@ -1295,11 +1295,11 @@ async function initTerminal(){
       if(e.data instanceof ArrayBuffer)term.write(new Uint8Array(e.data));
       else term.write(e.data);
     };
-    ws.onclose=function(){term.write('\r\n\x1b[31mConnection closed.\x1b[0m\r\n');};
+    ws.onclose=function(){term.write('\\r\\nConnection closed. Refresh to reconnect.\\r\\n');};
     ws.onerror=function(){
       var conn=document.getElementById('terminal-connecting');
       if(conn)conn.style.display='none';
-      term.write('\r\n\x1b[31mWebSocket error — check that the Sandbox binding is configured.\x1b[0m\r\n');
+      term.write('\\r\\nWebSocket error.\\r\\n');
     };
     term.onData(function(data){if(ws.readyState===1)ws.send(data);});
     term.onResize(function(sz){

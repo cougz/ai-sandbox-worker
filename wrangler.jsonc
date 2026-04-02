@@ -47,5 +47,11 @@
 
   "r2_buckets": [
     { "binding": "STORAGE", "bucket_name": "sandbox-storage" }
-  ]
+  ],
+
+  // Workers Observability for audit logs and debugging
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  }
 }

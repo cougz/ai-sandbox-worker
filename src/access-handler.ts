@@ -198,21 +198,36 @@ export async function handleRequest(
 // ─── Authentication & Role Determination ──────────────────────────────────────
 
 function getRole(email: string, env: Env): UserRole {
+  if (!env.ADMIN_EMAILS) {
+    console.log("[AUTH] ADMIN_EMAILS not configured, defaulting to user role");
+    return "user";
+  }
   const admins = env.ADMIN_EMAILS.toLowerCase().split(",").map((e) => e.trim());
-  return admins.includes(email.toLowerCase()) ? "admin" : "user";
+  const isAdmin = admins.includes(email.toLowerCase());
+  console.log(`[AUTH] Role check for ${email}: ${isAdmin ? "admin" : "user"} (admins: ${admins.join(", ")})`);
+  return isAdmin ? "admin" : "user";
 }
 
 async function authenticateRequest(request: Request, env: Env): Promise<AuthenticatedUser | null> {
   const cookie = request.headers.get("Cookie");
+  console.log(`[AUTH] Cookie header present: ${!!cookie}`);
+  
   const jwtMatch = cookie?.match(/CF_Authorization=([^;]+)/);
-  if (!jwtMatch) return null;
+  if (!jwtMatch) {
+    console.log("[AUTH] No CF_Authorization cookie found");
+    return null;
+  }
+  console.log("[AUTH] CF_Authorization cookie found");
 
   try {
     const claims = await verifyAccessToken(env, jwtMatch[1]);
     const email = claims.email;
+    console.log(`[AUTH] JWT verified, email: ${email}`);
     const role = getRole(email, env);
+    console.log(`[AUTH] Authentication successful: ${email} (${role})`);
     return { email, role };
-  } catch {
+  } catch (err) {
+    console.log(`[AUTH] JWT verification failed: ${err}`);
     return null;
   }
 }

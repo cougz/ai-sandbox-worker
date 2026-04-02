@@ -164,7 +164,7 @@ export async function handleRequest(
   // ── WebSocket: interactive terminal for /dash ─────────────────────────────
   // The browser sends the __Host-DASH_SESSION cookie automatically; we
   // authenticate from that session before proxying to the container sandbox.
-  if (pathname === "/ws/terminal") {
+  if (pathname === "/dash/ws/terminal") {
     if (request.headers.get("Upgrade") !== "websocket") {
       return new Response("WebSocket upgrade required", { status: 426 });
     }
@@ -1284,7 +1284,7 @@ async function initTerminal(){
     resizeObs.observe(container);
     // Connect WebSocket — cookies are sent automatically (session auth)
     var proto=location.protocol==='https:'?'wss:':'ws:';
-    var ws=new WebSocket(proto+'//'+location.host+'/ws/terminal');
+    var ws=new WebSocket(proto+'//'+location.host+'/dash/ws/terminal');
     termWs=ws;
     ws.binaryType='arraybuffer';
     ws.onopen=function(){

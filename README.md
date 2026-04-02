@@ -128,14 +128,7 @@ wrangler r2 bucket create sandbox-storage
 
 Replace `REPLACE_WITH_OAUTH_KV_ID` and `REPLACE_WITH_D1_ID` with the values printed by the commands above.
 
-Also update `ADMIN_EMAILS` with comma-separated admin email addresses:
 
-```jsonc
-"vars": {
-  "PUBLIC_URL": "https://ai-sandbox.cloudemo.org",
-  "ADMIN_EMAILS": "admin1@cloudflare.com,admin2@cloudflare.com"
-}
-```
 
 ---
 
@@ -214,12 +207,16 @@ wrangler secret put ACCESS_TOKEN_URL
 wrangler secret put ACCESS_AUTHORIZATION_URL
 wrangler secret put ACCESS_JWKS_URL
 
+# Admin configuration - comma-separated list of admin emails
+wrangler secret put ADMIN_EMAILS
+# e.g. admin1@cloudflare.com,admin2@cloudflare.com
+
 # Cookie signing key - any long random string
 wrangler secret put COOKIE_ENCRYPTION_KEY
 # e.g. openssl rand -hex 32
 ```
 
-**Note:** `ADMIN_SECRET` has been removed. Admin access is now controlled entirely via Cloudflare Access + `ADMIN_EMAILS` environment variable.
+**Note:** `ADMIN_SECRET` has been removed. Admin access is now controlled entirely via Cloudflare Access + `ADMIN_EMAILS` secret.
 
 ---
 
@@ -228,7 +225,22 @@ wrangler secret put COOKIE_ENCRYPTION_KEY
 | Variable | Default | Description |
 |---|---|---|
 | `PUBLIC_URL` | `https://ai-sandbox.cloudemo.org` | Base URL used to build shareable `/view` links from `get_url`. Update if you use a different domain. |
-| `ADMIN_EMAILS` | (required) | Comma-separated list of admin email addresses. These users get full dashboard access; all other authenticated users get limited access. |
+
+---
+
+## Secrets
+
+Set via `wrangler secret put <name>` after deploying:
+
+| Secret | Description |
+|---|---|
+| `ADMIN_EMAILS` | Comma-separated list of admin email addresses. These users get full dashboard access; all other authenticated users get limited access. |
+| `ACCESS_CLIENT_ID` | Cloudflare Access for SaaS - Client ID |
+| `ACCESS_CLIENT_SECRET` | Cloudflare Access for SaaS - Client secret |
+| `ACCESS_TOKEN_URL` | Cloudflare Access for SaaS - Token endpoint |
+| `ACCESS_AUTHORIZATION_URL` | Cloudflare Access for SaaS - Authorization endpoint |
+| `ACCESS_JWKS_URL` | Cloudflare Access for SaaS - JWKS endpoint |
+| `COOKIE_ENCRYPTION_KEY` | Random string for cookie signing (e.g. `openssl rand -hex 32`) |
 
 ---
 
@@ -438,7 +450,7 @@ The LLM can use any styling approach - write self-contained HTML with inline CSS
 
 If you were previously using `/admin` with `ADMIN_SECRET`:
 
-1. **Update `ADMIN_EMAILS`** in `wrangler.jsonc` with admin email addresses
+1. **Set `ADMIN_EMAILS`** as a secret: `wrangler secret put ADMIN_EMAILS` (comma-separated emails)
 2. **Remove `ADMIN_SECRET`** from Wrangler secrets: `wrangler secret delete ADMIN_SECRET`
 3. **Update Access Policy** to protect `/dash` instead of `/admin`
 4. **Update bookmarks** from `/admin` to `/dash`

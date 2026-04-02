@@ -872,6 +872,7 @@ nav{flex:1;padding:8px 0}
 .nav-item:hover{color:var(--cf-text);background:var(--cf-bg-hover)}
 .nav-item.active{color:var(--cf-orange);border-left-color:var(--cf-orange);background:rgba(255,72,1,.05);font-weight:500}
 .nav-ico{width:14px;height:14px;flex-shrink:0}
+.nav-num{font-size:9px;font-variant-numeric:tabular-nums;letter-spacing:.06em;color:var(--cf-text-subtle);min-width:16px;flex-shrink:0;line-height:1}
 #main{flex:1;overflow-y:auto;height:100vh}
 .section{display:none;padding:36px 44px;max-width:1140px}
 .section.active{display:block}
@@ -1070,24 +1071,32 @@ function toast(msg,ok){var el=document.getElementById('toast');el.textContent=ms
 async function api(path,opts){opts=opts||{};var res=await fetch(BASE+'/api'+path,Object.assign({credentials:'include'},opts));if(res.status===401){window.location.reload();return null;}if(res.status===403){toast('Access denied',false);return null;}return res;}
 
 // Navigation
+// Icon SVG inner-content strings — multi-element, 16×16 viewBox, round caps/joins
+var ICONS={
+  users:'<circle cx="5.5" cy="5" r="2.5"/><path d="M1 14c0-2.5 2-4.5 4.5-4.5s4.5 2 4.5 4.5"/><circle cx="11.5" cy="5" r="2"/><path d="M14.5 14c0-2-1.5-3.5-3-3.5"/>',
+  tools:'<path d="M2 4h12M2 8h12M2 12h12"/><circle cx="5" cy="4" r="1.5"/><circle cx="11" cy="8" r="1.5"/><circle cx="7" cy="12" r="1.5"/>',
+  files:'<path d="M1.5 5A1.5 1.5 0 013 3.5h4L8.5 5H13A1.5 1.5 0 0114.5 6.5v6A1.5 1.5 0 0113 14H3a1.5 1.5 0 01-1.5-1.5z"/>',
+  logs:'<rect x="2.5" y="1.5" width="11" height="13" rx="1.5"/><path d="M5 5.5h6M5 8h6M5 10.5h3.5"/>',
+  account:'<circle cx="8" cy="5.5" r="2.5"/><path d="M3 14c0-2.8 2.2-5 5-5s5 2.2 5 5"/>'
+};
 var navItems=IS_ADMIN?[
-  {id:'users',label:'Users',ico:'users'},
-  {id:'tools',label:'Tools',ico:'tools'},
-  {id:'files',label:'Files',ico:'files'},
-  {id:'logs',label:'Logs',ico:'logs'},
-  {id:'account',label:'My Account',ico:'account'}
+  {id:'users',label:'Users',svg:ICONS.users},
+  {id:'tools',label:'Tools',svg:ICONS.tools},
+  {id:'files',label:'Files',svg:ICONS.files},
+  {id:'logs',label:'Logs',svg:ICONS.logs},
+  {id:'account',label:'My Account',svg:ICONS.account}
 ]:[
-  {id:'tools',label:'Tools',ico:'tools'},
-  {id:'files',label:'Files',ico:'files'},
-  {id:'account',label:'My Account',ico:'account'}
+  {id:'tools',label:'Tools',svg:ICONS.tools},
+  {id:'files',label:'Files',svg:ICONS.files},
+  {id:'account',label:'My Account',svg:ICONS.account}
 ];
 
 function buildNav(){
   var nav=document.getElementById('nav');nav.innerHTML='';
   navItems.forEach(function(item,idx){
+    var num=String(idx+1).padStart(2,'0');
     var div=document.createElement('div');div.className='nav-item'+(idx===0?' active':'');div.dataset.sec=item.id;
-    var icoPath=item.ico==='users'?'M1 13c0-2.761 2.239-5 5-5s5 2.239 5 5M12 6a2 2 0 1 0 0-4 2 2 0 0 0 0 4':item.ico==='tools'?'M10.5 1.5L9 3l4 4 1.5-1.5a2.121 2.121 0 0 0-3-3zM9 3L4.5 7.5l1 3-3 3 1 1 3-3 3 1L14 7l-5-4z':item.ico==='files'?'M2 3.5A1.5 1.5 0 0 1 3.5 2H7l2 2h3.5A1.5 1.5 0 0 1 14 5.5v7A1.5 1.5 0 0 1 12.5 14h-9A1.5 1.5 0 0 1 2 12.5v-9z':item.ico==='logs'?'M2 2h12v12H2V2zm2 2v2h8V4H4zm0 3v2h8V7H4zm0 3v2h5v-2H4z':item.ico==='account'?'M8 8a3 3 0 1 0 0-6 3 3 0 0 0 0 6zm0 2a5 5 0 0 0-5 5v1h10v-1a5 5 0 0 0-5-5z':'M1 13c0-2.761 2.239-5 5-5s5 2.239 5 5';
-    div.innerHTML='<svg class="nav-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="'+icoPath+'"/></svg><span>'+esc(item.label)+'</span>';
+    div.innerHTML='<span class="nav-num">'+num+'</span><svg class="nav-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.25" stroke-linecap="round" stroke-linejoin="round">'+item.svg+'</svg><span>'+esc(item.label)+'</span>';
     nav.appendChild(div);
   });
 }

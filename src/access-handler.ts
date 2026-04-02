@@ -1004,7 +1004,7 @@ function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').repl
 function toast(msg,ok){var el=document.getElementById('toast');el.textContent=msg;el.style.background=(ok===false)?'var(--cf-error)':'var(--cf-text)';el.classList.add('show');setTimeout(function(){el.classList.remove('show');},2500);}
 
 // API calls - cookie is sent automatically by browser
-async function api(path,opts){opts=opts||{};var res=await fetch(BASE+'/api'+path,Object.assign({},opts));if(res.status===401){window.location.reload();return null;}if(res.status===403){toast('Access denied',false);return null;}return res;}
+async function api(path,opts){opts=opts||{};var res=await fetch(BASE+'/api'+path,Object.assign({credentials:'include'},opts));if(res.status===401){window.location.reload();return null;}if(res.status===403){toast('Access denied',false);return null;}return res;}
 
 // Navigation
 var navItems=IS_ADMIN?[

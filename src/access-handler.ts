@@ -186,7 +186,10 @@ export async function handleRequest(
   if (pathname === "/dash") {
     const user = await authenticateRequest(request, env);
     if (!user) return new Response("Unauthorized", { status: 401 });
-    return serveDashboard(user);
+    // Issue a signed session cookie so that the dashboard's JavaScript fetch()
+    // calls to /api/* can authenticate without CF Access headers.
+    const sessionCookie = await createSessionCookie(user, env.COOKIE_ENCRYPTION_KEY);
+    return serveDashboard(user, sessionCookie);
   }
 
   // ── Dashboard API ─────────────────────────────────────────────────────────
@@ -209,34 +212,94 @@ function getRole(email: string, env: Env): UserRole {
 }
 
 async function authenticateRequest(request: Request, env: Env): Promise<AuthenticatedUser | null> {
-  // Cloudflare Access adds these headers when protecting an endpoint
-  const email = request.headers.get("cf-access-authenticated-user-email");
+  // Primary path: Cloudflare Access injects these headers on the initial page load.
+  const email        = request.headers.get("cf-access-authenticated-user-email");
   const jwtAssertion = request.headers.get("cf-access-jwt-assertion");
-  
+
   console.log(`[AUTH] cf-access-authenticated-user-email: ${email}`);
   console.log(`[AUTH] cf-access-jwt-assertion present: ${!!jwtAssertion}`);
-  
-  if (!email) {
-    console.log("[AUTH] No email header from Cloudflare Access");
-    return null;
+
+  if (email) {
+    // We trust the header — Access validated the JWT at the edge before forwarding.
+    if (jwtAssertion) console.log("[AUTH] JWT assertion present (verified by Cloudflare Access edge)");
+    const role = getRole(email, env);
+    console.log(`[AUTH] CF-Access header auth: ${email} (${role})`);
+    return { email, role };
   }
-  
-  // Optionally verify the JWT assertion for extra security
-  // For now, we trust the headers since Access validates at the edge
-  if (jwtAssertion) {
-    try {
-      // Verify the JWT assertion using the team's JWKS
-      // The assertion uses a different JWKS than the SaaS app
-      // For now, we skip verification since Access already validated it
-      console.log("[AUTH] JWT assertion present (verified by Access)");
-    } catch (err) {
-      console.log(`[AUTH] JWT assertion verification skipped: ${err}`);
+
+  // Fallback path: JavaScript fetch() calls to /api/* don't carry CF Access headers.
+  // Instead we accept a signed session cookie that was issued when /dash loaded.
+  if (env.COOKIE_ENCRYPTION_KEY) {
+    const sessionUser = await readSessionCookie(request, env.COOKIE_ENCRYPTION_KEY);
+    if (sessionUser) {
+      console.log(`[AUTH] Session cookie auth: ${sessionUser.email} (${sessionUser.role})`);
+      return sessionUser;
     }
   }
-  
-  const role = getRole(email, env);
-  console.log(`[AUTH] Authentication successful: ${email} (${role})`);
-  return { email, role };
+
+  console.log("[AUTH] No CF-Access header and no valid session cookie — unauthenticated");
+  return null;
+}
+
+// ─── Dashboard Session Cookie ─────────────────────────────────────────────────
+// Issued when /dash loads successfully (CF Access header present).
+// Carried automatically by the browser on every subsequent fetch() to /api/*,
+// solving the reload loop caused by missing CF Access headers on XHR/fetch calls.
+
+const SESSION_COOKIE = "__Host-DASH_SESSION";
+const SESSION_TTL    = 8 * 60 * 60; // 8 hours
+
+interface SessionPayload {
+  email: string;
+  role:  UserRole;
+  exp:   number; // Unix timestamp
+}
+
+async function sessionHmacKey(secret: string): Promise<CryptoKey> {
+  return crypto.subtle.importKey(
+    "raw", new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"],
+  );
+}
+
+async function createSessionCookie(user: AuthenticatedUser, secret: string): Promise<string> {
+  const payload: SessionPayload = { email: user.email, role: user.role, exp: Math.floor(Date.now() / 1000) + SESSION_TTL };
+  const payloadB64 = btoa(JSON.stringify(payload));
+  const key        = await sessionHmacKey(secret);
+  const raw        = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(payloadB64));
+  const sig        = Array.from(new Uint8Array(raw)).map(b => b.toString(16).padStart(2, "0")).join("");
+  return `${SESSION_COOKIE}=${sig}.${payloadB64}; HttpOnly; Secure; Path=/; SameSite=Lax; Max-Age=${SESSION_TTL}`;
+}
+
+async function readSessionCookie(request: Request, secret: string): Promise<AuthenticatedUser | null> {
+  const cookieHeader = request.headers.get("Cookie") ?? "";
+  const match        = cookieHeader.split(";").map(c => c.trim()).find(c => c.startsWith(`${SESSION_COOKIE}=`));
+  if (!match) return null;
+
+  const raw = match.slice(SESSION_COOKIE.length + 1);
+  const dot = raw.indexOf(".");
+  if (dot < 1) return null;
+
+  const sig        = raw.slice(0, dot);
+  const payloadB64 = raw.slice(dot + 1);
+
+  const key   = await sessionHmacKey(secret);
+  const bytes = new Uint8Array(sig.match(/.{1,2}/g)!.map(b => parseInt(b, 16)));
+  const valid = await crypto.subtle.verify("HMAC", key, bytes.buffer, new TextEncoder().encode(payloadB64));
+  if (!valid) {
+    console.log("[AUTH] Session cookie signature invalid");
+    return null;
+  }
+
+  let payload: SessionPayload;
+  try { payload = JSON.parse(atob(payloadB64)) as SessionPayload; }
+  catch { return null; }
+
+  if (payload.exp < Math.floor(Date.now() / 1000)) {
+    console.log("[AUTH] Session cookie expired");
+    return null;
+  }
+  return { email: payload.email, role: payload.role };
 }
 
 function jsonResp(body: unknown, status = 200): Response {
@@ -783,7 +846,7 @@ async function handleApi(request: Request, env: Env, ctx: ExecutionContext): Pro
 
 // ─── Dashboard HTML ───────────────────────────────────────────────────────────
 
-function serveDashboard(user: AuthenticatedUser): Response {
+function serveDashboard(user: AuthenticatedUser, sessionCookie: string): Response {
   const isAdmin = user.role === "admin";
   
   const html = `<!DOCTYPE html>
@@ -1136,5 +1199,10 @@ window.addEventListener('load',function(){buildNav();showSection(navItems[0].id)
 </body>
 </html>`;
   
-  return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+  return new Response(html, {
+    headers: {
+      "Content-Type": "text/html; charset=utf-8",
+      "Set-Cookie":   sessionCookie,
+    },
+  });
 }

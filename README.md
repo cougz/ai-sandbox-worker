@@ -22,7 +22,9 @@ OpenCode / MCP client
 │  ├── /authorize → Cloudflare Access     │
 │  ├── /callback  → Access OIDC callback  │
 │  ├── /view      → Workspace file server │
-│  └── /admin     → Admin dashboard       │
+│  └── /dash      → Unified dashboard     │
+│       ├── Admin view (full access)      │
+│       └── User view (limited access)    │
 └─────────────────────────────────────────┘
         │
         ├── Durable Object (SandboxAgent) - one per MCP session
@@ -31,8 +33,18 @@ OpenCode / MCP client
         ├── D1 Database - persistent workspace files per user
         ├── R2 Bucket   - large file spill-over
         ├── KV (OAUTH_KV)     - OAuth tokens & state
-        └── KV (USER_REGISTRY) - admin user registry
+        └── KV (USER_REGISTRY) - user registry
 ```
+
+### Role-Based Access Control
+
+The dashboard (`/dash`) uses **unified authentication via Cloudflare Access** with **role-based authorization**:
+
+- **All users** authenticate through Cloudflare Access (via One-Time PIN or Identity Provider)
+- **Role determination** happens server-side by checking the user's email against `ADMIN_EMAILS`
+- **Admins** see full dashboard with Users, Tools, Files, Logs, and My Account sections
+- **Regular users** see limited dashboard with Tools, Files, and My Account sections
+- **Server-side enforcement** - API endpoints return 403 for unauthorized operations
 
 ### How Code Mode + Dynamic Workers fit together
 
@@ -40,32 +52,32 @@ OpenCode / MCP client
 MCP client sends a natural-language task
         │
         ▼
-  SandboxAgent (Durable Object)
+   SandboxAgent (Durable Object)
         │
         │  LLM writes an async JS function using codemode.* tool calls
         ▼
-  DynamicWorkerExecutor (from @cloudflare/codemode)
+   DynamicWorkerExecutor (from @cloudflare/codemode)
         │  spins up an isolated Worker via the LOADER binding
         ▼
-  ┌─────────────────────────────────────────────┐
-  │  Isolated V8 Sandbox (Dynamic Worker)        │
-  │                                             │
-  │  async () => {                              │
-  │    const data = await codemode.kvGet(key)  │
-  │    if (data) {                              │
-  │      await codemode.kvSet(key, transform)  │
-  │    }                                        │
-  │    return result                            │
-  │  }                                          │
-  │                                             │
-  │  ✗ No outbound network (globalOutbound:null)│
-  │  ✓ codemode.* → Workers RPC → host tools   │
-  └─────────────────────────────────────────────┘
+   ┌─────────────────────────────────────────────┐
+   │  Isolated V8 Sandbox (Dynamic Worker)        │
+   │                                             │
+   │  async () => {                              │
+   │    const data = await codemode.kvGet(key)  │
+   │    if (data) {                              │
+   │      await codemode.kvSet(key, transform)  │
+   │    }                                        │
+   │    return result                            │
+   │  }                                          │
+   │                                             │
+   │  ✗ No outbound network (globalOutbound:null)│
+   │  ✓ codemode.* → Workers RPC → host tools   │
+   └─────────────────────────────────────────────┘
         │
         │  Workers RPC (ToolDispatcher)
         ▼
-  Host Worker - executes the real tool logic
-  (state.*, codemode.* - full env access)
+   Host Worker - executes the real tool logic
+   (state.*, codemode.* - full env access)
 ```
 
 **Key design decisions:**
@@ -73,6 +85,7 @@ MCP client sends a natural-language task
 - `OAuthProvider` (from `@cloudflare/workers-oauth-provider`) wraps `McpAgent.serve()` - the [officially recommended pattern](https://github.com/cloudflare/ai) for authenticated MCP servers on Workers.
 - Workspaces are backed by **D1** (not the DO's ephemeral SQLite), so files persist across sessions.
 - The `/view` endpoint is **public** - report links can be shared with anyone without requiring login.
+- **Authentication is 100% Cloudflare Access** - no shared secrets, no API keys, role-based access controlled via email allowlist.
 
 
 ---
@@ -89,7 +102,7 @@ MCP client sends a natural-language task
 
 ### 1. KV namespace
 
-`OAUTH_KV` and `USER_REGISTRY` can share a single KV namespace. Key prefixes don't collide (`oauth:*` vs `user:*`), so no new namespace is needed if you already have one.
+`OAUTH_KV` and `USER_REGISTRY` can share a single KV namespace. Key prefixes don't collide (`oauth:*` for OAuth state, `user:*` for user registry), so no new namespace is needed if you already have one.
 
 Create one if starting from scratch:
 
@@ -115,17 +128,54 @@ wrangler r2 bucket create sandbox-storage
 
 Replace `REPLACE_WITH_OAUTH_KV_ID` and `REPLACE_WITH_D1_ID` with the values printed by the commands above.
 
+Also update `ADMIN_EMAILS` with comma-separated admin email addresses:
+
+```jsonc
+"vars": {
+  "PUBLIC_URL": "https://ai-sandbox.cloudemo.org",
+  "ADMIN_EMAILS": "admin1@cloudflare.com,admin2@cloudflare.com"
+}
+```
+
 ---
 
 ## Cloudflare Access setup (Zero Trust dashboard)
 
-Authentication uses **Cloudflare Access for SaaS (OIDC)**. This gives you an OAuth server backed by your existing Identity Provider (Google, Okta, etc.) without managing OAuth infrastructure yourself.
+Authentication uses **Cloudflare Access for SaaS (OIDC)**. This gives you an OAuth server backed by your existing Identity Provider (Google, Okta, etc.) or One-Time PIN without managing OAuth infrastructure yourself.
 
-### Step 1 - Ensure you have an Identity Provider configured
+### Step 1 - Configure One-Time PIN (Recommended for testing)
 
-Zero Trust → Settings → Authentication → Add a provider (e.g. Google).
+Zero Trust → Settings → Authentication → **Add a provider** → **One-time PIN**
 
-### Step 2 - Create an Access for SaaS application
+Or use your existing Identity Provider (Google, Okta, Azure AD, etc.).
+
+### Step 2 - Create an Access Application
+
+Zero Trust → Access → Applications → **Add an application** → **Self-hosted**
+
+| Field | Value |
+|---|---|
+| Application name | `AI Sandbox Dashboard` |
+| Subdomain / Domain | `ai-sandbox` (or your domain) |
+| Path | `/dash` |
+
+Click **Next**.
+
+### Step 3 - Add an Access Policy
+
+Create an **Allow** policy:
+
+| Setting | Value |
+|---|---|
+| Policy name | `Allow Cloudflare Users` |
+| Action | Allow |
+| Include | Emails ending in: `@cloudflare.com` |
+
+Add additional **Include** rules for specific admin emails if they don't match the domain pattern.
+
+Click **Save**.
+
+### Step 4 - Create Access for SaaS application (for MCP OAuth)
 
 Zero Trust → Access → Applications → **Add an application** → **SaaS**
 
@@ -146,9 +196,9 @@ Click **Save**. Note the values on the next screen:
 | `ACCESS_AUTHORIZATION_URL` | "Authorization endpoint" |
 | `ACCESS_JWKS_URL` | "Key endpoint" |
 
-### Step 3 - Add an Access policy
+### Step 5 - Add a policy to the SaaS application
 
-On the same application, add a policy to restrict which users can authenticate (e.g. by email domain, identity provider group, or specific emails).
+Add the same **Allow** policy as Step 3 (or restrict further as needed).
 
 ---
 
@@ -157,7 +207,7 @@ On the same application, add a policy to restrict which users can authenticate (
 Set all secrets via Wrangler after deploying:
 
 ```bash
-# Cloudflare Access for SaaS credentials (from step 2 above)
+# Cloudflare Access for SaaS credentials (from Step 4 above)
 wrangler secret put ACCESS_CLIENT_ID
 wrangler secret put ACCESS_CLIENT_SECRET
 wrangler secret put ACCESS_TOKEN_URL
@@ -167,11 +217,9 @@ wrangler secret put ACCESS_JWKS_URL
 # Cookie signing key - any long random string
 wrangler secret put COOKIE_ENCRYPTION_KEY
 # e.g. openssl rand -hex 32
-
-# Admin dashboard password
-wrangler secret put ADMIN_SECRET
-# e.g. openssl rand -hex 16
 ```
+
+**Note:** `ADMIN_SECRET` has been removed. Admin access is now controlled entirely via Cloudflare Access + `ADMIN_EMAILS` environment variable.
 
 ---
 
@@ -180,6 +228,7 @@ wrangler secret put ADMIN_SECRET
 | Variable | Default | Description |
 |---|---|---|
 | `PUBLIC_URL` | `https://ai-sandbox.cloudemo.org` | Base URL used to build shareable `/view` links from `get_url`. Update if you use a different domain. |
+| `ADMIN_EMAILS` | (required) | Comma-separated list of admin email addresses. These users get full dashboard access; all other authenticated users get limited access. |
 
 ---
 
@@ -188,7 +237,7 @@ wrangler secret put ADMIN_SECRET
 | Binding | Purpose | Notes |
 |---|---|---|
 | `OAUTH_KV` | OAuth provider state (client registrations, tokens, auth codes) | Managed automatically by `@cloudflare/workers-oauth-provider` |
-| `USER_REGISTRY` | Admin user listing - populated automatically on first login | Keys: `user:{email}` → `{email, name, createdAt}` |
+| `USER_REGISTRY` | User listing - populated automatically on first login | Keys: `user:{email}` → `{email, name, createdAt}` |
 
 ---
 
@@ -281,17 +330,36 @@ Returns a stable, shareable URL for any file in the workspace. Defaults to your 
 
 ---
 
-## Admin dashboard
+## Dashboard (`/dash`)
 
-Visit `https://<your-domain>/admin` and enter your `ADMIN_SECRET`.
+Visit `https://<your-domain>/dash` after authenticating via Cloudflare Access.
 
-Features:
-- Lists all users who have authenticated (auto-populated)
-- Shows file count per user's workspace
-- Expand any user to see individual files, with **View ↗** links for HTML reports
-- Wipe a user's entire workspace
-- Delete individual files
-- Remove a user from the registry (workspace data in D1 is preserved)
+The dashboard **automatically adapts** based on your role:
+
+### Admin View (email is in `ADMIN_EMAILS`)
+
+**Navigation**: Users | Tools | Files | Logs | My Account
+
+- **Users**: List all authenticated users, provision new users, browse workspaces, wipe workspaces, remove users
+- **Tools**: View built-in and custom tools, edit JSON, browse tool directories, delete custom tools
+- **Files**: Browse any user's workspace or shared workspace, view/edit/delete files
+- **Logs**: View structured Worker events (7-day TTL)
+- **My Account**: Personal stats (email, name, first login, file count)
+
+### User View (email not in `ADMIN_EMAILS`)
+
+**Navigation**: Tools | Files | My Account
+
+- **Tools**: View built-in and custom tools (no edit/delete)
+- **Files**: Browse your personal workspace only (no other users' workspaces)
+- **My Account**: Personal stats (email, name, first login, file count)
+
+### Security Model
+
+- **Authentication**: Handled entirely by Cloudflare Access at the edge
+- **Authorization**: Server-side role checking on every request
+- **Data isolation**: Backend enforces workspace access; frontend only renders what it receives
+- **No secrets in frontend**: Role is never exposed to client-side code
 
 ---
 
@@ -337,7 +405,6 @@ The LLM can use any styling approach - write self-contained HTML with inline CSS
 
 - **JWT verification uses Access JWKS** - currently fetches the JWKS on every callback. Should cache the public key in KV with a reasonable TTL to avoid the extra network round-trip and potential failures.
 - **`/view` is fully public** - anyone with a URL can read any workspace file. Consider adding an optional `token` query parameter for sensitive reports, or gating `/view` behind Access with a bypass for specific file types.
-- **Admin secret is a plain string header** - replace with Cloudflare Access protecting `/admin` directly (add a second Access Application scoped to your email only).
 - **D1 workspace has no per-user isolation at the SQL level** - a bug or exploit in the shell library could theoretically read another user's files. Consider row-level security or separate D1 databases per user.
 
 ### Workspace persistence
@@ -363,4 +430,17 @@ The LLM can use any styling approach - write self-contained HTML with inline CSS
 
 - **No observability** - add `observability: { enabled: true }` to `wrangler.jsonc` and instrument `run_code` calls with timing and error metrics.
 - **No workspace TTL** - files live forever. Add a DO Alarm on first write that cleans up workspace files older than N days.
-- **Admin dashboard has no pagination** - the `GET /admin/api/users` endpoint returns all users at once. Add cursor-based pagination once the user count grows.
+- **Admin dashboard has no pagination** - the `GET /api/users` endpoint returns all users at once. Add cursor-based pagination once the user count grows.
+
+---
+
+## Migration from legacy admin panel
+
+If you were previously using `/admin` with `ADMIN_SECRET`:
+
+1. **Update `ADMIN_EMAILS`** in `wrangler.jsonc` with admin email addresses
+2. **Remove `ADMIN_SECRET`** from Wrangler secrets: `wrangler secret delete ADMIN_SECRET`
+3. **Update Access Policy** to protect `/dash` instead of `/admin`
+4. **Update bookmarks** from `/admin` to `/dash`
+
+The dashboard will automatically detect your role based on email and show the appropriate interface.

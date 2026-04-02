@@ -30,11 +30,11 @@
   ],
 
   "vars": {
-    "PUBLIC_URL": "https://ai-sandbox.cloudemo.org"
+    "PUBLIC_URL": "https://ai-sandbox.cloudemo.org",
+    "ADMIN_EMAILS": "admin1@cloudflare.com,admin2@cloudflare.com"
   },
 
   // Secrets — set after deploy:
-  //   wrangler secret put ADMIN_SECRET
   //
   // Cloudflare Access for SaaS OIDC (create app in Zero Trust → Access → Applications → SaaS):
   //   wrangler secret put ACCESS_CLIENT_ID

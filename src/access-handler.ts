@@ -27,6 +27,13 @@ interface UserRecord {
   createdAt: string;
 }
 
+type UserRole = "admin" | "user";
+
+interface AuthenticatedUser {
+  email: string;
+  role: UserRole;
+}
+
 // ─── Built-in tool definitions ────────────────────────────────────────────────
 // Single source of truth lives in ./tool-defs.ts.  Both agent.ts and this file
 // derive their copies from the same function — no manual sync required.
@@ -47,8 +54,8 @@ const CONTENT_TYPES: Record<string, string> = {
 // Handles everything that is NOT /mcp:
 //   /authorize, /callback  ← Access OAuth flow
 //   /view                  ← public workspace file viewer (personal or shared)
-//   /admin                 ← admin dashboard
-//   /admin/api/*           ← admin REST API
+//   /dash                  ← unified dashboard (admin + user views)
+//   /api/*                 ← dashboard REST API
 
 export async function handleRequest(
   request: Request,
@@ -175,13 +182,43 @@ export async function handleRequest(
     });
   }
 
-  // ── Admin dashboard ───────────────────────────────────────────────────────
-  if (pathname === "/admin") return adminDashboard();
+  // ── Unified dashboard ─────────────────────────────────────────────────────
+  if (pathname === "/dash") {
+    const user = await authenticateRequest(request, env);
+    if (!user) return new Response("Unauthorized", { status: 401 });
+    return serveDashboard(user);
+  }
 
-  // ── Admin API ─────────────────────────────────────────────────────────────
-  if (pathname.startsWith("/admin/api")) return handleAdminApi(request, env, _ctx);
+  // ── Dashboard API ─────────────────────────────────────────────────────────
+  if (pathname.startsWith("/api")) return handleApi(request, env, _ctx);
 
   return new Response("Not found", { status: 404 });
+}
+
+// ─── Authentication & Role Determination ──────────────────────────────────────
+
+function getRole(email: string, env: Env): UserRole {
+  const admins = env.ADMIN_EMAILS.toLowerCase().split(",").map((e) => e.trim());
+  return admins.includes(email.toLowerCase()) ? "admin" : "user";
+}
+
+async function authenticateRequest(request: Request, env: Env): Promise<AuthenticatedUser | null> {
+  const cookie = request.headers.get("Cookie");
+  const jwtMatch = cookie?.match(/CF_Authorization=([^;]+)/);
+  if (!jwtMatch) return null;
+
+  try {
+    const claims = await verifyAccessToken(env, jwtMatch[1]);
+    const email = claims.email;
+    const role = getRole(email, env);
+    return { email, role };
+  } catch {
+    return null;
+  }
+}
+
+function jsonResp(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
 }
 
 // ─── Workspace factory (D1-backed) ────────────────────────────────────────────
@@ -271,7 +308,7 @@ async function fetchAccessPublicKey(env: Env, kid: string): Promise<CryptoKey> {
   if (!env.ACCESS_JWKS_URL) throw new Error("ACCESS_JWKS_URL not set");
   const resp = await fetch(env.ACCESS_JWKS_URL);
   const { keys } = await resp.json<{ keys: (JsonWebKey & { kid: string })[] }>();
-  const jwk = keys.find(k => k.kid === kid);
+  const jwk = keys.find((k) => k.kid === kid);
   if (!jwk) throw new Error(`No key found for kid=${kid}`);
   return crypto.subtle.importKey("jwk", jwk, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["verify"]);
 }
@@ -326,41 +363,71 @@ function writeLog(
   );
 }
 
-// ─── Admin API ────────────────────────────────────────────────────────────────
+// ─── Dashboard API ────────────────────────────────────────────────────────────
 
-function isAdmin(request: Request, env: Env): boolean {
-  return !!env.ADMIN_SECRET && request.headers.get("X-Admin-Key") === env.ADMIN_SECRET;
-}
-
-function jsonResp(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
-}
-
-async function handleAdminApi(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-  if (!isAdmin(request, env)) {
-    writeLog(env, ctx, "warn", "admin.auth.fail", { ip: request.headers.get("cf-connecting-ip") ?? "unknown" });
+async function handleApi(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  const user = await authenticateRequest(request, env);
+  if (!user) {
+    writeLog(env, ctx, "warn", "api.auth.fail", { ip: request.headers.get("cf-connecting-ip") ?? "unknown" });
     return jsonResp({ error: "Unauthorized" }, 401);
   }
 
   const url    = new URL(request.url);
-  const path   = url.pathname.replace(/^\/admin\/api/, "");
+  const path   = url.pathname.replace(/^\/api/, "");
   const method = request.method.toUpperCase();
 
-  // ── GET /logs — fetch recent log entries from KV ring-buffer ──────────────
+  // ── GET /navigation — return navigation items based on role ───────────────
+  if (method === "GET" && path === "/navigation") {
+    const items = user.role === "admin"
+      ? [
+          { id: "users", label: "Users" },
+          { id: "tools", label: "Tools" },
+          { id: "files", label: "Files" },
+          { id: "logs", label: "Logs" },
+          { id: "account", label: "My Account" },
+        ]
+      : [
+          { id: "tools", label: "Tools" },
+          { id: "files", label: "Files" },
+          { id: "account", label: "My Account" },
+        ];
+    return jsonResp({ items });
+  }
+
+  // ── GET /me — current user info ───────────────────────────────────────────
+  if (method === "GET" && path === "/me") {
+    const record = await env.USER_REGISTRY.get<UserRecord>(`user:${user.email}`, "json");
+    if (!record) return jsonResp({ error: "User not found" }, 404);
+    
+    let fileCount = 0;
+    try {
+      const entries = await makeWorkspace(user.email, env).glob("/**/*") as Array<{ type: string }>;
+      fileCount = entries.filter((e) => e.type === "file").length;
+    } catch { /* workspace may be empty */ }
+    
+    return jsonResp({ ...record, fileCount, role: user.role });
+  }
+
+  // ── GET /logs — fetch recent log entries from KV ring-buffer (admin only) ─
   if (method === "GET" && path === "/logs") {
+    if (user.role !== "admin") {
+      writeLog(env, ctx, "warn", "api.forbidden", { path, email: user.email });
+      return jsonResp({ error: "Forbidden" }, 403);
+    }
+    
     const limit = Math.min(parseInt(url.searchParams.get("limit") ?? "200"), 500);
     const levelFilter = url.searchParams.get("level") ?? "all";
     try {
       const list = await env.USER_REGISTRY.list({ prefix: "log:", limit });
       const entries = await Promise.all(
-        list.keys.map(async k => {
+        list.keys.map(async (k) => {
           const raw = await env.USER_REGISTRY.get(k.name);
           if (!raw) return null;
           try { return JSON.parse(raw) as LogEntry; } catch { return null; }
         })
       );
       let logs = entries.filter(Boolean) as LogEntry[];
-      if (levelFilter !== "all") logs = logs.filter(l => l.level === levelFilter);
+      if (levelFilter !== "all") logs = logs.filter((l) => l.level === levelFilter);
       logs.sort((a, b) => b.ts.localeCompare(a.ts)); // newest first
       return jsonResp(logs);
     } catch (err) { return jsonResp({ error: String(err) }, 500); }
@@ -374,7 +441,7 @@ async function handleAdminApi(request: Request, env: Env, ctx: ExecutionContext)
       const ws = makeSharedWorkspace(env);
       const entries = await ws.glob("/tools/*.json") as Array<{ path: string; type: string; size: number }>;
       const tools = await Promise.all(
-        entries.filter(e => e.type === "file").map(async e => {
+        entries.filter((e) => e.type === "file").map(async (e) => {
           try {
             const content = await ws.readFile(e.path);
             if (!content) return { path: e.path, size: e.size };
@@ -387,8 +454,10 @@ async function handleAdminApi(request: Request, env: Env, ctx: ExecutionContext)
     } catch (err) { return jsonResp({ error: String(err) }, 500); }
   }
 
-  // POST /global-tools
+  // POST /global-tools (admin only)
   if (method === "POST" && path === "/global-tools") {
+    if (user.role !== "admin") return jsonResp({ error: "Forbidden" }, 403);
+    
     try {
       const body = await request.json<{ name?: string; description?: string; schema?: unknown; code?: string; path?: string; content?: string }>();
       let filePath: string;
@@ -412,8 +481,10 @@ async function handleAdminApi(request: Request, env: Env, ctx: ExecutionContext)
     }
   }
 
-  // DELETE /global-tools?name=...
+  // DELETE /global-tools?name=... (admin only)
   if (method === "DELETE" && path === "/global-tools") {
+    if (user.role !== "admin") return jsonResp({ error: "Forbidden" }, 403);
+    
     const name = url.searchParams.get("name");
     if (!name) return jsonResp({ error: "Missing ?name=" }, 400);
     try {
@@ -429,13 +500,17 @@ async function handleAdminApi(request: Request, env: Env, ctx: ExecutionContext)
   // ── Shared workspace endpoints ─────────────────────────────────────────────
 
   if (method === "GET" && path === "/shared/files") {
+    if (user.role !== "admin") return jsonResp({ error: "Forbidden" }, 403);
+    
     try {
       const entries = await makeSharedWorkspace(env).glob("/**/*") as Array<{ path: string; type: string; size: number }>;
-      return jsonResp(entries.filter(e => e.type === "file").map(e => ({ path: e.path, size: e.size })));
+      return jsonResp(entries.filter((e) => e.type === "file").map((e) => ({ path: e.path, size: e.size })));
     } catch (err) { return jsonResp({ error: String(err) }, 500); }
   }
 
   if (method === "POST" && path === "/shared/files") {
+    if (user.role !== "admin") return jsonResp({ error: "Forbidden" }, 403);
+    
     try {
       const body = await request.json<{ path: string; content: string }>();
       if (!body.path)              return jsonResp({ error: "path is required" }, 400);
@@ -450,6 +525,8 @@ async function handleAdminApi(request: Request, env: Env, ctx: ExecutionContext)
   }
 
   if (method === "DELETE" && path === "/shared/files") {
+    if (user.role !== "admin") return jsonResp({ error: "Forbidden" }, 403);
+    
     const filePath = url.searchParams.get("path");
     if (!filePath) return jsonResp({ error: "Missing ?path=" }, 400);
     try {
@@ -465,21 +542,38 @@ async function handleAdminApi(request: Request, env: Env, ctx: ExecutionContext)
   // ── User endpoints ─────────────────────────────────────────────────────────
 
   if (method === "GET" && path === "/users") {
-    const list = await env.USER_REGISTRY.list({ prefix: "user:" });
-    const users = await Promise.all(list.keys.map(async k => {
-      const r = await env.USER_REGISTRY.get<UserRecord>(k.name, "json");
-      if (!r) return null;
+    if (user.role === "admin") {
+      // Admin: return all users
+      const list = await env.USER_REGISTRY.list({ prefix: "user:" });
+      const users = await Promise.all(list.keys.map(async (k) => {
+        const r = await env.USER_REGISTRY.get<UserRecord>(k.name, "json");
+        if (!r) return null;
+        let fileCount = 0;
+        try {
+          const entries = await makeWorkspace(r.email, env).glob("/**/*") as Array<{ type: string }>;
+          fileCount = entries.filter((e) => e.type === "file").length;
+        } catch { /* workspace may be empty */ }
+        return { ...r, fileCount };
+      }));
+      return jsonResp(users.filter(Boolean));
+    } else {
+      // Non-admin: return current user only
+      const record = await env.USER_REGISTRY.get<UserRecord>(`user:${user.email}`, "json");
+      if (!record) return jsonResp({ error: "User not found" }, 404);
+      
       let fileCount = 0;
       try {
-        const entries = await makeWorkspace(r.email, env).glob("/**/*") as Array<{ type: string }>;
-        fileCount = entries.filter(e => e.type === "file").length;
+        const entries = await makeWorkspace(user.email, env).glob("/**/*") as Array<{ type: string }>;
+        fileCount = entries.filter((e) => e.type === "file").length;
       } catch { /* workspace may be empty */ }
-      return { ...r, fileCount };
-    }));
-    return jsonResp(users.filter(Boolean));
+      
+      return jsonResp([{ ...record, fileCount }]); // Return as array for consistent frontend
+    }
   }
 
   if (method === "POST" && path === "/users") {
+    if (user.role !== "admin") return jsonResp({ error: "Forbidden" }, 403);
+    
     const body = await request.json<{ name?: string; email: string }>();
     if (!body.email) return jsonResp({ error: "email is required" }, 400);
     await ensureUserRecord(body.email, body.name ?? body.email, env);
@@ -491,8 +585,15 @@ async function handleAdminApi(request: Request, env: Env, ctx: ExecutionContext)
   if (userMatch) {
     const email = decodeURIComponent(userMatch[1]);
     const sub   = userMatch[2] ?? "";
+    
+    // Non-admins can only access their own user record
+    if (user.role !== "admin" && email !== user.email) {
+      return jsonResp({ error: "Forbidden" }, 403);
+    }
 
     if (method === "DELETE" && sub === "") {
+      if (user.role !== "admin") return jsonResp({ error: "Forbidden" }, 403);
+      
       await env.USER_REGISTRY.delete(`user:${email}`);
       writeLog(env, ctx, "info", "admin.users.remove", { email });
       return jsonResp({ deleted: email });
@@ -503,14 +604,16 @@ async function handleAdminApi(request: Request, env: Env, ctx: ExecutionContext)
     if (method === "GET" && sub === "/files") {
       try {
         const entries = await workspace.glob("/**/*") as Array<{ path: string; type: string; size: number }>;
-        return jsonResp(entries.filter(e => e.type === "file").map(e => ({ path: e.path, size: e.size })));
+        return jsonResp(entries.filter((e) => e.type === "file").map((e) => ({ path: e.path, size: e.size })));
       } catch (err) { return jsonResp({ error: String(err) }, 500); }
     }
 
     if (method === "DELETE" && sub === "/workspace") {
+      if (user.role !== "admin") return jsonResp({ error: "Forbidden" }, 403);
+      
       try {
         const entries = await workspace.glob("/**/*") as Array<{ path: string; type: string }>;
-        await Promise.all(entries.filter(e => e.type === "file").map(e => workspace.rm(e.path)));
+        await Promise.all(entries.filter((e) => e.type === "file").map((e) => workspace.rm(e.path)));
         writeLog(env, ctx, "info", "admin.workspace.wipe", { email, files: entries.length });
       } catch { /* already empty */ }
       return jsonResp({ wiped: email });
@@ -533,8 +636,8 @@ async function handleAdminApi(request: Request, env: Env, ctx: ExecutionContext)
     let customTools: unknown[] = [];
     try {
       const entries = await ws.glob("/tools/**") as Array<{ path: string; type: string }>;
-      const dir  = entries.filter(e => e.type === "file" && /^\/tools\/[^/]+\/tool\.json$/.test(e.path));
-      const flat = entries.filter(e => e.type === "file" && /^\/tools\/[^/]+\.json$/.test(e.path));
+      const dir  = entries.filter((e) => e.type === "file" && /^\/tools\/[^/]+\/tool\.json$/.test(e.path));
+      const flat = entries.filter((e) => e.type === "file" && /^\/tools\/[^/]+\.json$/.test(e.path));
       const seen = new Set<string>();
       const loaded: unknown[] = [];
       for (const entry of [...dir, ...flat]) {
@@ -544,12 +647,16 @@ async function handleAdminApi(request: Request, env: Env, ctx: ExecutionContext)
         if (!raw) continue;
         try {
           const def = JSON.parse(raw);
+          // Add actions based on role
+          (def as Record<string, unknown>).actions = user.role === "admin" 
+            ? ["view", "edit", "delete"] 
+            : ["view"];
           // For directory tools, list supporting files
           if (/^\/tools\/[^/]+\/tool\.json$/.test(entry.path)) {
             const toolDir = entry.path.replace("/tool.json", "");
-            def._files = entries
-              .filter(e => e.type === "file" && e.path.startsWith(toolDir + "/") && e.path !== entry.path)
-              .map(e => e.path);
+            (def as Record<string, unknown>)._files = entries
+              .filter((e) => e.type === "file" && e.path.startsWith(toolDir + "/") && e.path !== entry.path)
+              .map((e) => e.path);
           }
           loaded.push(def);
           seen.add(m[1]);
@@ -566,10 +673,16 @@ async function handleAdminApi(request: Request, env: Env, ctx: ExecutionContext)
   if (method === "GET" && path === "/files") {
     const wsName = url.searchParams.get("workspace");
     if (!wsName) return jsonResp({ error: "Missing ?workspace=" }, 400);
+    
+    // Non-admins can only access their own workspace
+    if (user.role !== "admin" && wsName !== user.email && wsName !== "shared") {
+      return jsonResp({ error: "Forbidden" }, 403);
+    }
+    
     const ws = wsName === "shared" ? makeSharedWorkspace(env) : makeWorkspace(wsName, env);
     try {
       const entries = await ws.glob("/**/*") as Array<{ path: string; type: string; size: number }>;
-      return jsonResp(entries.filter(e => e.type === "file").map(e => ({ path: e.path, size: e.size })));
+      return jsonResp(entries.filter((e) => e.type === "file").map((e) => ({ path: e.path, size: e.size })));
     } catch { return jsonResp([]); }
   }
 
@@ -577,6 +690,12 @@ async function handleAdminApi(request: Request, env: Env, ctx: ExecutionContext)
     const wsName   = url.searchParams.get("workspace");
     const filePath = url.searchParams.get("path");
     if (!wsName || !filePath) return jsonResp({ error: "Missing params" }, 400);
+    
+    // Non-admins can only access their own workspace
+    if (user.role !== "admin" && wsName !== user.email && wsName !== "shared") {
+      return jsonResp({ error: "Forbidden" }, 403);
+    }
+    
     const content = await (wsName === "shared" ? makeSharedWorkspace(env) : makeWorkspace(wsName, env)).readFile(filePath);
     if (content === null) return jsonResp({ error: "File not found" }, 404);
     return new Response(content, { headers: { "Content-Type": "text/plain; charset=utf-8" } });
@@ -586,6 +705,12 @@ async function handleAdminApi(request: Request, env: Env, ctx: ExecutionContext)
     const wsName   = url.searchParams.get("workspace");
     const filePath = url.searchParams.get("path");
     if (!wsName || !filePath) return jsonResp({ error: "Missing params" }, 400);
+    
+    // Non-admins can only access their own workspace
+    if (user.role !== "admin" && wsName !== user.email && wsName !== "shared") {
+      return jsonResp({ error: "Forbidden" }, 403);
+    }
+    
     const content = await request.text();
     const ws = wsName === "shared" ? makeSharedWorkspace(env) : makeWorkspace(wsName, env);
     await ws.writeFile(filePath, content);
@@ -597,6 +722,12 @@ async function handleAdminApi(request: Request, env: Env, ctx: ExecutionContext)
     const wsName  = url.searchParams.get("workspace");
     const dirPath = url.searchParams.get("path");
     if (!wsName || !dirPath) return jsonResp({ error: "Missing params" }, 400);
+    
+    // Non-admins can only access their own workspace
+    if (user.role !== "admin" && wsName !== user.email && wsName !== "shared") {
+      return jsonResp({ error: "Forbidden" }, 403);
+    }
+    
     const ws = wsName === "shared" ? makeSharedWorkspace(env) : makeWorkspace(wsName, env);
     await ws.writeFile(dirPath.replace(/\/*$/, "") + "/.keep", "");
     writeLog(env, ctx, "info", "admin.files.mkdir", { workspace: wsName, path: dirPath });
@@ -607,6 +738,12 @@ async function handleAdminApi(request: Request, env: Env, ctx: ExecutionContext)
     const wsName   = url.searchParams.get("workspace");
     const filePath = url.searchParams.get("path");
     if (!wsName || !filePath) return jsonResp({ error: "Missing params" }, 400);
+    
+    // Non-admins can only access their own workspace
+    if (user.role !== "admin" && wsName !== user.email && wsName !== "shared") {
+      return jsonResp({ error: "Forbidden" }, 403);
+    }
+    
     const ws = wsName === "shared" ? makeSharedWorkspace(env) : makeWorkspace(wsName, env);
     try {
       await ws.rm(filePath);
@@ -619,26 +756,26 @@ async function handleAdminApi(request: Request, env: Env, ctx: ExecutionContext)
   }
 
   writeLog(env, ctx, "warn", "admin.api.not_found", { method, path });
-  return jsonResp({ error: "Not found" }, 404);
+  return jsonResp({ error: "Not found" }, 404 );
 }
 
-// ─── Admin HTML dashboard (sidebar-nav shell, 3 sections) ───────────────
+// ─── Dashboard HTML ───────────────────────────────────────────────────────────
 
-function adminDashboard(): Response {
+function serveDashboard(user: AuthenticatedUser): Response {
+  const isAdmin = user.role === "admin";
+  
   const html = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>AI Sandbox — Admin</title>
+<title>AI Sandbox — Dashboard</title>
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA2NiA2NiI+PHJlY3Qgd2lkdGg9IjY2IiBoZWlnaHQ9IjY2IiByeD0iOSIgZmlsbD0iI0ZGNDgwMSIvPjxnIHRyYW5zZm9ybT0idHJhbnNsYXRlKDAsMTgpIiBmaWxsPSJ3aGl0ZSI+PHBhdGggZD0iTTUyLjY4OCAxMy4wMjhjLS4yMiAwLS40MzcuMDA4LS42NTQuMDE1YS4zLjMgMCAwIDAtLjEwMi4wMjQuMzcuMzcgMCAwIDAtLjIzNi4yNTVsLS45MyAzLjI0OWMtLjQwMSAxLjM5Ny0uMjUyIDIuNjg3LjQyMiAzLjYzNC42MTguODc2IDEuNjQ2IDEuMzkgMi44OTQgMS40NWw1LjA0NS4zMDZhLjQ1LjQ1IDAgMCAxIC40MzUuNDEuNS41IDAgMCAxLS4wMjUuMjIzLjY0LjY0IDAgMCAxLS41NDcuNDI2bC01LjI0Mi4zMDZjLTIuODQ4LjEzMi01LjkxMiAyLjQ1Ni02Ljk4NyA1LjI5bC0uMzc4IDFhLjI4LjI4IDAgMCAwIC4yNDguMzgyaDE4LjA1NGEuNDguNDggMCAwIDAgLjQ2NC0uMzVjLjMyLTEuMTUzLjQ4Mi0yLjM0NC40OC0zLjU0IDAtNy4yMi01Ljc5LTEzLjA3Mi0xMi45MzMtMTMuMDcyTTQ0LjgwNyAyOS41NzhsLjMzNC0xLjE3NWMuNDAyLTEuMzk3LjI1My0yLjY4Ny0uNDItMy42MzQtLjYyLS44NzYtMS42NDctMS4zOS0yLjg5Ni0xLjQ1bC0yMy42NjUtLjMwNmEuNDcuNDcgMCAwIDEtLjM3NC0uMTk5LjUuNSAwIDAgMS0uMDUyLS40MzQuNjQuNjQgMCAwIDEgLjU1Mi0uNDI2bDIzLjg4Ni0uMzA2YzIuODM2LS4xMzEgNS45LTIuNDU2IDYuOTc1LTUuMjlsMS4zNjItMy42YS45LjkgMCAwIDAgLjA0LS40NzdDNDguOTk3IDUuMjU5IDQyLjc4OSAwIDM1LjM2NyAwYy02Ljg0MiAwLTEyLjY0NyA0LjQ2Mi0xNC43MyAxMC42NjVhNi45MiA2LjkyIDAgMCAwLTQuOTExLTEuMzc0Yy0zLjI4LjMzLTUuOTIgMy4wMDItNi4yNDYgNi4zMThhNy4yIDcuMiAwIDAgMCAuMTggMi40NzJDNC4zIDE4LjI0MSAwIDIyLjY3OSAwIDI4LjEzM3EwIC43NC4xMDYgMS40NTNhLjQ2LjQ2IDAgMCAwIC40NTcuNDAyaDQzLjcwNGEuNTcuNTcgMCAwIDAgLjU0LS40MTgiLz48L2c+PC9zdmc+">
 <style>
 html{color-scheme:light}*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{--cf-orange:#FF4801;--cf-text:#521000;--cf-text-muted:rgba(82,16,0,.7);--cf-text-subtle:rgba(82,16,0,.4);--cf-bg:#FFFBF5;--cf-bg-card:#FFFDFB;--cf-bg-hover:#FEF7ED;--cf-border:#EBD5C1;--cf-success:#16A34A;--cf-error:#DC2626}
 html,body{height:100%;overflow:hidden}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--cf-bg);color:var(--cf-text);line-height:1.5;-webkit-font-smoothing:antialiased}
-#auth-overlay{position:fixed;inset:0;background:var(--cf-bg);display:flex;align-items:center;justify-content:center;z-index:200}
-.auth-box{background:var(--cf-bg-card);border:1px solid var(--cf-border);padding:32px;width:360px}
-#app{display:none;height:100vh}
+#app{height:100vh}
 .shell{display:flex;height:100vh}
 #sidebar{width:220px;min-width:220px;height:100vh;border-right:1px solid var(--cf-border);display:flex;flex-direction:column;background:var(--cf-bg)}
 .logo-area{padding:18px 16px 14px;display:flex;align-items:center;gap:10px;border-bottom:1px solid var(--cf-border)}
@@ -649,7 +786,6 @@ nav{flex:1;padding:8px 0}
 .nav-item{display:flex;align-items:center;gap:9px;padding:9px 16px;cursor:pointer;font-size:13px;color:var(--cf-text-muted);border-left:2px solid transparent;transition:all .1s;user-select:none}
 .nav-item:hover{color:var(--cf-text);background:var(--cf-bg-hover)}
 .nav-item.active{color:var(--cf-orange);border-left-color:var(--cf-orange);background:rgba(255,72,1,.05);font-weight:500}
-.nav-num{font-size:10px;font-weight:700;color:var(--cf-text-subtle);min-width:18px}
 .nav-ico{width:14px;height:14px;flex-shrink:0}
 #main{flex:1;overflow-y:auto;height:100vh}
 .section{display:none;padding:36px 44px;max-width:1140px}
@@ -722,52 +858,24 @@ tr:hover td{background:var(--cf-bg-hover)}
 .toast.show{opacity:1}
 .file-editor-ta{background:#1C0A00;color:#f5e6d3;font-family:"SF Mono","Fira Code",monospace;font-size:12px;line-height:1.5;padding:13px 14px;min-height:540px;max-height:80vh;overflow-y:auto;resize:vertical;width:100%;outline:none;border:1px solid #3a1500;display:block;border-radius:0}
 .file-editor-ta:focus{border-color:var(--cf-orange)}
+.account-info{display:grid;grid-template-columns:200px 1fr;gap:16px;margin-bottom:24px}
+.account-label{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--cf-text-muted)}
+.account-value{font-size:14px;color:var(--cf-text)}
 </style>
 </head>
 <body>
-<div id="auth-overlay">
-  <div class="auth-box">
-    <div style="margin-bottom:20px">
-      <div style="font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.09em;color:var(--cf-text-muted);margin-bottom:5px">AI Sandbox Worker</div>
-      <div style="font-size:20px;font-weight:500;letter-spacing:-.02em">Admin Dashboard</div>
-    </div>
-    <label for="admin-key">Admin Secret</label>
-    <input type="password" id="admin-key" placeholder="Enter ADMIN_SECRET" style="margin-bottom:14px">
-    <button class="primary" id="unlock-btn" style="width:100%">Unlock</button>
-    <div id="auth-error" style="color:var(--cf-error);font-size:12px;margin-top:8px;display:none">Incorrect secret</div>
-  </div>
-</div>
 <div id="app"><div class="shell">
   <aside id="sidebar">
     <div class="logo-area">
       <svg class="logo-svg" viewBox="0 0 66 30" fill="currentColor"><path d="M52.688 13.028c-.22 0-.437.008-.654.015a.3.3 0 0 0-.102.024.37.37 0 0 0-.236.255l-.93 3.249c-.401 1.397-.252 2.687.422 3.634.618.876 1.646 1.39 2.894 1.45l5.045.306a.45.45 0 0 1 .435.41.5.5 0 0 1-.025.223.64.64 0 0 1-.547.426l-5.242.306c-2.848.132-5.912 2.456-6.987 5.29l-.378 1a.28.28 0 0 0 .248.382h18.054a.48.48 0 0 0 .464-.35c.32-1.153.482-2.344.48-3.54 0-7.22-5.79-13.072-12.933-13.072M44.807 29.578l.334-1.175c.402-1.397.253-2.687-.42-3.634-.62-.876-1.647-1.39-2.896-1.45l-23.665-.306a.47.47 0 0 1-.374-.199.5.5 0 0 1-.052-.434.64.64 0 0 1 .552-.426l23.886-.306c2.836-.131 5.9-2.456 6.975-5.29l1.362-3.6a.9.9 0 0 0 .04-.477C48.997 5.259 42.789 0 35.367 0c-6.842 0-12.647 4.462-14.73 10.665a6.92 6.92 0 0 0-4.911-1.374c-3.28.33-5.92 3.002-6.246 6.318a7.2 7.2 0 0 0 .18 2.472C4.3 18.241 0 22.679 0 28.133q0 .74.106 1.453a.46.46 0 0 0 .457.402h43.704a.57.57 0 0 0 .54-.418"/></svg>
-      <div><div class="logo-eyebrow">Cloudflare</div><div class="logo-name">Sandbox Admin</div></div>
+      <div><div class="logo-eyebrow">Cloudflare</div><div class="logo-name">Sandbox</div></div>
     </div>
     <nav id="nav">
-      <div class="nav-item active" data-sec="users">
-        <span class="nav-num">01</span>
-        <svg class="nav-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="6" cy="5" r="2.5"/><path d="M1 13c0-2.761 2.239-5 5-5s5 2.239 5 5"/><circle cx="12" cy="6" r="2"/><path d="M15 13c0-1.657-1.343-3-3-3"/></svg>
-        <span>Users</span>
-      </div>
-      <div class="nav-item" data-sec="tools">
-        <span class="nav-num">02</span>
-        <svg class="nav-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M10.5 1.5 9 3l4 4 1.5-1.5a2.121 2.121 0 0 0-3-3z"/><path d="M9 3 4.5 7.5l1 3-3 3 1 1 3-3 3 1L14 7l-5-4z"/></svg>
-        <span>Tools</span>
-      </div>
-      <div class="nav-item" data-sec="files">
-        <span class="nav-num">03</span>
-        <svg class="nav-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M2 3.5A1.5 1.5 0 0 1 3.5 2H7l2 2h3.5A1.5 1.5 0 0 1 14 5.5v7A1.5 1.5 0 0 1 12.5 14h-9A1.5 1.5 0 0 1 2 12.5v-9z"/></svg>
-        <span>Files</span>
-      </div>
-      <div class="nav-item" data-sec="logs">
-        <span class="nav-num">04</span>
-        <svg class="nav-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="2" width="12" height="12" rx="1.5"/><path d="M5 5h6M5 8h6M5 11h4"/></svg>
-        <span>Logs</span>
-      </div>
+      <!-- Navigation items will be loaded dynamically -->
     </nav>
   </aside>
   <main id="main">
-    <div id="sec-users" class="section active">
+    <div id="sec-users" class="section">
       <div class="sec-title">Users</div>
       <div class="sec-sub">Users appear automatically after their first Access login. Workspaces are persistent across sessions.</div>
       <div class="card">
@@ -822,7 +930,6 @@ tr:hover td{background:var(--cf-bg-hover)}
       </div>
     </div>
 
-    <!-- 04 Logs -->
     <div id="sec-logs" class="section">
       <div class="sec-title">Logs</div>
       <div class="sec-sub">Structured Worker events stored in KV (7-day TTL). All entries also appear in <strong>Cloudflare Workers Observability</strong> and <code style="font-family:monospace;font-size:11px;background:rgba(235,213,193,.4);padding:1px 5px;border-radius:3px">wrangler tail</code>.</div>
@@ -841,20 +948,71 @@ tr:hover td{background:var(--cf-bg-hover)}
       </div>
     </div>
 
+    <div id="sec-account" class="section">
+      <div class="sec-title">My Account</div>
+      <div class="sec-sub">Your workspace and account information.</div>
+      <div class="card">
+        <div class="card-hdr"><span class="card-hdr-label">Account Details</span></div>
+        <div class="card-body">
+          <div class="account-info">
+            <div class="account-label">Email</div>
+            <div class="account-value" id="account-email">Loading&hellip;</div>
+            <div class="account-label">Name</div>
+            <div class="account-value" id="account-name">Loading&hellip;</div>
+            <div class="account-label">First Login</div>
+            <div class="account-value" id="account-created">Loading&hellip;</div>
+            <div class="account-label">Workspace Files</div>
+            <div class="account-value" id="account-files">Loading&hellip;</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
   </main>
 </div></div>
 <div class="toast" id="toast"></div>
 <script>
-var ADMIN_KEY='',BASE=window.location.origin,bWs='shared',bPath='/',bFiles=[],pendingEditFile=null,currentEditPath='';
+// User configuration injected by server
+const USER_EMAIL = ${JSON.stringify(user.email)};
+const IS_ADMIN = ${JSON.stringify(isAdmin)};
+
+var BASE=window.location.origin,bWs='shared',bPath='/',bFiles=[],pendingEditFile=null,currentEditPath='';
 var logLevel='all',logTimer=null;
 function esc(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
 function toast(msg,ok){var el=document.getElementById('toast');el.textContent=msg;el.style.background=(ok===false)?'var(--cf-error)':'var(--cf-text)';el.classList.add('show');setTimeout(function(){el.classList.remove('show');},2500);}
-async function api(path,opts){opts=opts||{};var h=Object.assign({'X-Admin-Key':ADMIN_KEY},opts.headers||{});var res=await fetch(BASE+'/admin/api'+path,Object.assign({},opts,{headers:h}));if(res.status===401){showAuth();return null;}return res;}
-async function authenticate(){var key=document.getElementById('admin-key').value.trim();if(!key)return;ADMIN_KEY=key;var res=await api('/users');if(!res){document.getElementById('auth-error').style.display='block';ADMIN_KEY='';return;}sessionStorage.setItem('adminKey',key);document.getElementById('auth-overlay').style.display='none';document.getElementById('app').style.display='block';renderUsers(await res.json());}
-function showAuth(){sessionStorage.removeItem('adminKey');document.getElementById('auth-overlay').style.display='flex';document.getElementById('app').style.display='none';}
-function showSection(name){document.querySelectorAll('.section').forEach(function(el){el.classList.remove('active');});document.getElementById('sec-'+name).classList.add('active');document.querySelectorAll('.nav-item').forEach(function(el){el.classList.remove('active');});document.querySelector('[data-sec="'+name+'"]').classList.add('active');if(name==='tools')loadTools();if(name==='files')populateWsSel(bWs).then(loadBrowserFiles);if(name==='logs'){loadLogs();if(!logTimer)logTimer=setInterval(loadLogs,30000);}else{if(logTimer){clearInterval(logTimer);logTimer=null;}}}
+
+// API calls - cookie is sent automatically by browser
+async function api(path,opts){opts=opts||{};var res=await fetch(BASE+'/api'+path,Object.assign({},opts));if(res.status===401){window.location.reload();return null;}if(res.status===403){toast('Access denied',false);return null;}return res;}
+
+// Navigation
+var navItems=IS_ADMIN?[
+  {id:'users',label:'Users',ico:'users'},
+  {id:'tools',label:'Tools',ico:'tools'},
+  {id:'files',label:'Files',ico:'files'},
+  {id:'logs',label:'Logs',ico:'logs'},
+  {id:'account',label:'My Account',ico:'account'}
+]:[
+  {id:'tools',label:'Tools',ico:'tools'},
+  {id:'files',label:'Files',ico:'files'},
+  {id:'account',label:'My Account',ico:'account'}
+];
+
+function buildNav(){
+  var nav=document.getElementById('nav');nav.innerHTML='';
+  navItems.forEach(function(item,idx){
+    var div=document.createElement('div');div.className='nav-item'+(idx===0?' active':'');div.dataset.sec=item.id;
+    var icoPath=item.ico==='users'?'M1 13c0-2.761 2.239-5 5-5s5 2.239 5 5M12 6a2 2 0 1 0 0-4 2 2 0 0 0 0 4':item.ico==='tools'?'M10.5 1.5L9 3l4 4 1.5-1.5a2.121 2.121 0 0 0-3-3zM9 3L4.5 7.5l1 3-3 3 1 1 3-3 3 1L14 7l-5-4z':item.ico==='files'?'M2 3.5A1.5 1.5 0 0 1 3.5 2H7l2 2h3.5A1.5 1.5 0 0 1 14 5.5v7A1.5 1.5 0 0 1 12.5 14h-9A1.5 1.5 0 0 1 2 12.5v-9z':item.ico==='logs'?'M2 2h12v12H2V2zm2 2v2h8V4H4zm0 3v2h8V7H4zm0 3v2h5v-2H4z':item.ico==='account'?'M8 8a3 3 0 1 0 0-6 3 3 0 0 0 0 6zm0 2a5 5 0 0 0-5 5v1h10v-1a5 5 0 0 0-5-5z':'M1 13c0-2.761 2.239-5 5-5s5 2.239 5 5';
+    div.innerHTML='<svg class="nav-ico" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><path d="'+icoPath+'"/></svg><span>'+esc(item.label)+'</span>';
+    nav.appendChild(div);
+  });
+}
+
+function showSection(name){document.querySelectorAll('.section').forEach(function(el){el.classList.remove('active');});document.getElementById('sec-'+name).classList.add('active');document.querySelectorAll('.nav-item').forEach(function(el){el.classList.remove('active');});var navItem=document.querySelector('[data-sec="'+name+'"]');if(navItem)navItem.classList.add('active');if(name==='users')loadUsers();if(name==='tools')loadTools();if(name==='files'){if(IS_ADMIN)populateWsSel(bWs).then(loadBrowserFiles);else{bWs=USER_EMAIL;loadBrowserFiles();}}if(name==='logs'){loadLogs();if(!logTimer)logTimer=setInterval(loadLogs,30000);}else{if(logTimer){clearInterval(logTimer);logTimer=null;}}if(name==='account')loadAccount();}
+
 document.getElementById('nav').addEventListener('click',function(e){var item=e.target.closest('.nav-item');if(item)showSection(item.dataset.sec);});
-async function loadUsers(){var res=await api('/users');if(!res)return;renderUsers(await res.json());}
+
+/* ── 01 Users ── */
+async function loadUsers(){if(!IS_ADMIN)return;var res=await api('/users');if(!res)return;renderUsers(await res.json());}
 function renderUsers(users){document.getElementById('user-count').textContent=users.length+' users';if(!users.length){document.getElementById('users-body').innerHTML='<div class="empty">No users yet.</div>';return;}var rows='';users.forEach(function(u){rows+='<tr><td><strong>'+esc(u.name)+'</strong></td><td style="font-family:monospace;font-size:12px">'+esc(u.email)+'</td><td>'+new Date(u.createdAt).toLocaleDateString()+'</td><td><span class="badge '+(u.fileCount>0?'badge-g':'badge-m')+'">'+u.fileCount+' files</span></td><td style="white-space:nowrap"><button class="sm" data-action="browse" data-email="'+esc(u.email)+'">Browse</button> <button class="sm danger" data-action="wipe" data-email="'+esc(u.email)+'">Wipe</button> <button class="sm danger" data-action="remove" data-email="'+esc(u.email)+'">Remove</button></td></tr>';});document.getElementById('users-body').innerHTML='<table><thead><tr><th>Name</th><th>Email</th><th>First Login</th><th>Workspace</th><th>Actions</th></tr></thead><tbody>'+rows+'</tbody></table>';}
 document.getElementById('users-body').addEventListener('click',function(e){var btn=e.target.closest('button[data-action]');if(!btn)return;var a=btn.dataset.action,em=btn.dataset.email;if(a==='browse')browseUserFiles(em);if(a==='wipe')wipeWorkspace(em);if(a==='remove')removeUser(em);});
 document.getElementById('add-user-btn').addEventListener('click',async function(){var name=document.getElementById('new-name').value.trim(),email=document.getElementById('new-email').value.trim();if(!email)return;var res=await api('/users',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name,email:email})});if(res&&res.ok){toast('User added');document.getElementById('new-name').value='';document.getElementById('new-email').value='';loadUsers();}else toast('Error',false);});
@@ -862,7 +1020,8 @@ document.getElementById('refresh-btn').addEventListener('click',loadUsers);
 async function removeUser(email){if(!confirm('Remove '+email+'? Workspace files are NOT deleted.'))return;var res=await api('/users/'+encodeURIComponent(email),{method:'DELETE'});if(res&&res.ok){toast('User removed');loadUsers();}else toast('Error',false);}
 async function wipeWorkspace(email){if(!confirm('Wipe ALL files for '+email+'? This cannot be undone.'))return;var res=await api('/users/'+encodeURIComponent(email)+'/workspace',{method:'DELETE'});if(res&&res.ok){toast('Workspace wiped');loadUsers();}else toast('Error',false);}
 function browseUserFiles(email){bWs=email;bPath='/';bFiles=[];showSection('files');}
-function editToolJson(toolJsonPath){var dir=toolJsonPath.substring(0,toolJsonPath.lastIndexOf('/'));bWs='shared';bPath=dir;pendingEditFile=toolJsonPath;showSection('files');}
+
+/* ── 02 Tools ── */
 async function loadTools(){document.getElementById('tools-body').innerHTML='<div class="empty">Loading&hellip;</div>';var res=await api('/tools');if(!res||!res.ok){document.getElementById('tools-body').innerHTML='<div class="empty">Could not load tools.</div>';return;}renderTools(await res.json());}
 function renderTools(data){
   var html='';
@@ -881,22 +1040,24 @@ function renderTools(data){
   document.getElementById('tools-body').querySelectorAll('.files-toggle').forEach(function(btn){
     btn.addEventListener('click',function(){var fl=btn.closest('.tool-card').querySelector('.tool-files');var open=fl.style.display!=='none';fl.style.display=open?'none':'block';btn.innerHTML=open?'Files &#9656;':'Files &#9662;';});
   });
-  document.getElementById('tools-body').querySelectorAll('button[data-del-tool]').forEach(function(btn){
-    btn.addEventListener('click',function(){deleteGlobalTool(btn.dataset.delTool);});
-  });
-  document.getElementById('tools-body').querySelectorAll('button[data-browse-tool]').forEach(function(btn){
-    btn.addEventListener('click',function(){browseUserFiles('shared');setTimeout(function(){var f=btn.dataset.browseDir;if(f){bPath=f;renderTree();}},200);});
-  });
-  document.getElementById('tools-body').querySelectorAll('button[data-edit-json]').forEach(function(btn){
-    btn.addEventListener('click',function(){editToolJson(btn.dataset.editJson);});
-  });
+  if(IS_ADMIN){
+    document.getElementById('tools-body').querySelectorAll('button[data-del-tool]').forEach(function(btn){
+      btn.addEventListener('click',function(){deleteGlobalTool(btn.dataset.delTool);});
+    });
+    document.getElementById('tools-body').querySelectorAll('button[data-browse-tool]').forEach(function(btn){
+      btn.addEventListener('click',function(){browseUserFiles('shared');setTimeout(function(){var f=btn.dataset.browseDir;if(f){bPath=f;renderTree();}},200);});
+    });
+    document.getElementById('tools-body').querySelectorAll('button[data-edit-json]').forEach(function(btn){
+      btn.addEventListener('click',function(){editToolJson(btn.dataset.editJson);});
+    });
+  }
 }
 function toolCard(t,type){
   var raw=t.params||t.schema||[];
   var params=Array.isArray(raw)?raw:Object.entries(raw).map(function(e){return{name:e[0],type:(e[1].type||'string'),description:(e[1].description||''),required:!e[1].optional};});
   var badge=type==='builtin'?'<span class="badge badge-g">built-in</span>':'<span class="badge badge-m">custom</span>';
   var actions=params.length?'<button class="sm param-toggle" style="margin-left:auto">Params &#9656;</button>':'<span style="margin-left:auto"></span>';
-  if(type==='custom'){
+  if(type==='custom'&&IS_ADMIN){
     if(t._files&&t._files.length){
       var toolDir=t._files[0].substring(0,t._files[0].lastIndexOf('/'));
       actions+=' <button class="sm files-toggle">Files &#9656;</button>';
@@ -915,12 +1076,15 @@ function toolCard(t,type){
   }
   return'<div class="tool-card"><div class="tool-card-hdr"><span class="tool-name">'+esc(t.name)+'</span>'+badge+actions+'</div><div class="tool-desc">'+esc(t.description||'')+'</div>'+tbl+filesSection+'</div>';
 }
-async function deleteGlobalTool(name){if(!confirm('Delete global tool "'+name+'"?'))return;var res=await api('/global-tools?name='+encodeURIComponent(name),{method:'DELETE'});if(res&&res.ok){toast('Tool deleted');loadTools();}else toast('Error',false);}
-async function populateWsSel(selectEmail){var sel=document.getElementById('ws-sel');var cur=selectEmail||sel.value||bWs;var res=await api('/users');if(!res)return;var users=await res.json();var opts='<option value="shared">Shared Workspace</option>';users.forEach(function(u){opts+='<option value="'+esc(u.email)+'">'+esc(u.email)+'</option>';});sel.innerHTML=opts;sel.value=cur;bWs=sel.value;}
-async function loadBrowserFiles(){var ws=document.getElementById('ws-sel').value||'shared';bWs=ws;bFiles=[];resetViewer();document.getElementById('file-tree').innerHTML='<div class="empty">Loading\u2026</div>';var res=await api('/files?workspace='+encodeURIComponent(ws));if(!res)return;bFiles=await res.json();renderTree();if(pendingEditFile){var pef=pendingEditFile;pendingEditFile=null;await viewFile(pef);document.querySelectorAll('#file-tree .tree-row').forEach(function(r){if(r.dataset.path===pef)r.classList.add('selected');});}}
-function listDir(){var prefix=bPath==='/'?'/':bPath+'/';var seen=new Set(),dirs=[],files=[];bFiles.forEach(function(f){if(!f.path.startsWith(prefix))return;var rest=f.path.slice(prefix.length);if(!rest)return;var slash=rest.indexOf('/');if(slash===-1){if(!f.path.endsWith('/.keep'))files.push(f);}else{var d=rest.slice(0,slash);if(!seen.has(d)){seen.add(d);dirs.push(d);}}});return{dirs:dirs.sort(),files:files.sort(function(a,b){return a.path.localeCompare(b.path);})};}
+async function deleteGlobalTool(name){if(!IS_ADMIN)return;if(!confirm('Delete global tool "'+name+'"?'))return;var res=await api('/global-tools?name='+encodeURIComponent(name),{method:'DELETE'});if(res&&res.ok){toast('Tool deleted');loadTools();}else toast('Error',false);}
+function editToolJson(toolJsonPath){var dir=toolJsonPath.substring(0,toolJsonPath.lastIndexOf('/'));bWs='shared';bPath=dir;pendingEditFile=toolJsonPath;showSection('files');}
+
+/* ── 03 Files ── */
+async function populateWsSel(selectEmail){if(!IS_ADMIN)return;var sel=document.getElementById('ws-sel');var cur=selectEmail||sel.value||bWs;var res=await api('/users');if(!res)return;var users=await res.json();var opts='<option value="shared">Shared Workspace</option>';users.forEach(function(u){opts+='<option value="'+esc(u.email)+'">'+esc(u.email)+'</option>';});sel.innerHTML=opts;sel.value=cur;bWs=sel.value;}
+async function loadBrowserFiles(){var ws=IS_ADMIN?(document.getElementById('ws-sel').value||'shared'):USER_EMAIL;bWs=ws;bFiles=[];resetViewer();document.getElementById('file-tree').innerHTML='<div class="empty">Loading\u2026</div>';var res=await api('/files?workspace='+encodeURIComponent(ws));if(!res)return;bFiles=await res.json();renderTree();if(pendingEditFile){var pef=pendingEditFile;pendingEditFile=null;await viewFile(pef);document.querySelectorAll('#file-tree .tree-row').forEach(function(r){if(r.dataset.path===pef)r.classList.add('selected');});}}
+function listDir(){var prefix=bPath==='/'?'/':bPath+'/';var seen=new Set(),dirs=[],files=[];bFiles.forEach(function(f){if(!f.path.startsWith(prefix))return;var rest=f.path.slice(prefix.length);if(!rest)return;var slash=rest.indexOf('/');if(slash===-1){if(!f.path.endsWith('/.keep'))files.push(f);}else{var d=rest.slice(0,slash);if(!seen.has(d)){seen.add(d);dirs.push(d);}}});return{dirs:dirs.sort(),files:files.sort(function(a,b){return a.path.localeCompare(b.path);)};}
 function renderTree(){var info=listDir();var all=info.dirs.length+info.files.length;document.getElementById('fb-path').textContent=bPath;document.getElementById('fb-count').textContent=all+' ITEM'+(all!==1?'S':'');var html='';if(bPath!=='/')html+='<div class="tree-row" data-type="up"><span style="font-size:12px;color:var(--cf-text-muted)">&#8593;</span><span class="tree-name">..</span></div>';info.dirs.forEach(function(d){var dp=(bPath==='/'?'':bPath)+'/'+d;html+='<div class="tree-row" data-type="dir" data-path="'+esc(dp)+'"><span style="font-size:14px">&#128193;</span><span class="tree-name">'+esc(d)+'/</span><button class="tree-del" data-path="'+esc(dp)+'" data-deltype="dir" title="Delete directory">&#215;</button></div>';});info.files.forEach(function(f){var name=f.path.split('/').pop();var sz=f.size<1024?f.size+' B':(f.size<1048576?Math.round(f.size/1024)+' KB':Math.round(f.size/1048576)+' MB');var vu=getViewUrl(f.path);html+='<div class="tree-row" data-type="file" data-path="'+esc(f.path)+'"><span style="font-size:14px">&#128196;</span><span class="tree-name">'+esc(name)+'</span><span class="tree-size">'+sz+'</span><a class="tree-url" href="'+esc(vu)+'" target="_blank" rel="noopener" title="Open in browser">&#128279;</a><button class="tree-del" data-path="'+esc(f.path)+'" data-deltype="file" title="Delete">&#215;</button></div>';});if(!html)html='<div class="empty" style="padding:20px">Empty directory</div>';document.getElementById('file-tree').innerHTML=html;}
-document.getElementById('file-tree').addEventListener('click',function(e){if(e.target.closest('.tree-url'))return;var del=e.target.closest('.tree-del');if(del){e.stopPropagation();if(del.dataset.deltype==='dir')delDir(del.dataset.path);else delFile(del.dataset.path);return;}var row=e.target.closest('.tree-row');if(!row)return;var type=row.dataset.type;if(type==='up'){var parts=bPath.split('/').filter(Boolean);parts.pop();bPath=parts.length?'/'+parts.join('/'):'/';;renderTree();}else if(type==='dir'){bPath=row.dataset.path;renderTree();}else if(type==='file'){viewFile(row.dataset.path);document.querySelectorAll('.tree-row').forEach(function(r){r.classList.remove('selected');});row.classList.add('selected');}});
+document.getElementById('file-tree').addEventListener('click',function(e){if(e.target.closest('.tree-url'))return;var del=e.target.closest('.tree-del');if(del){e.stopPropagation();if(del.dataset.deltype==='dir')delDir(del.dataset.path);else delFile(del.dataset.path);return;}var row=e.target.closest('.tree-row');if(!row)return;var type=row.dataset.type;if(type==='up'){var parts=bPath.split('/').filter(Boolean);parts.pop();bPath=parts.length?'/'+parts.join('/'):'/';renderTree();}else if(type==='dir'){bPath=row.dataset.path;renderTree();}else if(type==='file'){viewFile(row.dataset.path);document.querySelectorAll('.tree-row').forEach(function(r){r.classList.remove('selected');});row.classList.add('selected');}});
 function getViewUrl(path){var base=window.location.origin;if(bWs==='shared')return base+'/view?shared=true&file='+encodeURIComponent(path);return base+'/view?user='+encodeURIComponent(bWs)+'&file='+encodeURIComponent(path);}
 function resetViewer(){currentEditPath='';document.getElementById('viewer-path').textContent='Select a file to view its contents';var editor=document.getElementById('file-editor');editor.value='';editor.setAttribute('readonly','');document.getElementById('save-file-btn').style.display='none';}
 async function viewFile(path){currentEditPath=path;document.getElementById('viewer-path').textContent=path;var editor=document.getElementById('file-editor');editor.value='Loading\u2026';editor.removeAttribute('readonly');document.getElementById('save-file-btn').style.display='';var res=await api('/files/read?workspace='+encodeURIComponent(bWs)+'&path='+encodeURIComponent(path));if(!res)return;var content=await res.text();editor.value=content;}
@@ -929,51 +1093,26 @@ async function delDir(dirPath){var children=bFiles.filter(function(f){return f.p
 async function saveFile(){if(!currentEditPath)return;var content=document.getElementById('file-editor').value;var res=await api('/files/write?workspace='+encodeURIComponent(bWs)+'&path='+encodeURIComponent(currentEditPath),{method:'POST',body:content});if(res&&res.ok)toast('Saved');else toast('Save failed',false);}
 document.getElementById('save-file-btn').addEventListener('click',saveFile);
 document.getElementById('ws-sel').addEventListener('change',function(){bWs=this.value;bPath='/';bFiles=[];loadBrowserFiles();});
-window.addEventListener('load',function(){var s=sessionStorage.getItem('adminKey');if(s){document.getElementById('admin-key').value=s;authenticate();}});
-document.getElementById('admin-key').addEventListener('keydown',function(e){if(e.key==='Enter')authenticate();});
-document.getElementById('unlock-btn').addEventListener('click',authenticate);
 
 /* ── 04 Logs ── */
 var LOG_LEVEL_COLORS={info:'var(--cf-text-muted)',warn:'#b45309',error:'var(--cf-error)'};
 var LOG_LEVEL_BG={info:'rgba(235,213,193,.3)',warn:'rgba(180,83,9,.08)',error:'rgba(220,38,38,.08)'};
-async function loadLogs(){
-  document.getElementById('log-count').textContent='Loading\u2026';
-  var res=await api('/logs?limit=200&level='+logLevel);
-  if(!res)return;
-  var logs=await res.json();
-  renderLogs(logs);
-}
-function renderLogs(logs){
-  document.getElementById('log-count').textContent=logs.length+' entries';
-  if(!logs.length){document.getElementById('logs-body').innerHTML='<div class="empty">No log entries yet. Actions in the admin panel will appear here.</div>';return;}
-  var html='<table style="font-size:12px"><thead><tr><th style="width:170px">Time</th><th style="width:60px">Level</th><th style="width:200px">Event</th><th>Data</th></tr></thead><tbody>';
-  logs.forEach(function(l){
-    var d=new Date(l.ts);
-    var ts=d.toLocaleDateString()+' '+d.toLocaleTimeString();
-    var dataStr=Object.keys(l.data||{}).length?JSON.stringify(l.data):'';
-    html+='<tr style="background:'+LOG_LEVEL_BG[l.level||\'info\']+'">'
-      +'<td style="font-family:monospace;font-size:11px;color:var(--cf-text-muted);white-space:nowrap">'+esc(ts)+'</td>'
-      +'<td><span style="font-size:10px;font-weight:700;text-transform:uppercase;color:'+LOG_LEVEL_COLORS[l.level||\'info\']+'">'+esc(l.level||'info')+'</span></td>'
-      +'<td style="font-family:monospace;font-size:11px">'+esc(l.event||'')+'</td>'
-      +'<td style="font-family:monospace;font-size:11px;color:var(--cf-text-muted);word-break:break-all">'+esc(dataStr)+'</td>'
-      +'</tr>';
-  });
-  html+='</tbody></table>';
-  document.getElementById('logs-body').innerHTML=html;
-}
-document.getElementById('log-filter').addEventListener('click',function(e){
-  var btn=e.target.closest('button[data-lvl]');if(!btn)return;
-  logLevel=btn.dataset.lvl;
-  document.querySelectorAll('#log-filter button').forEach(function(b){b.classList.remove('active-filter');b.style.fontWeight='';});
-  btn.classList.add('active-filter');btn.style.fontWeight='600';
-  loadLogs();
-});
+async function loadLogs(){if(!IS_ADMIN)return;document.getElementById('log-count').textContent='Loading\u2026';var res=await api('/logs?limit=200&level='+logLevel);if(!res)return;var logs=await res.json();renderLogs(logs);}
+function renderLogs(logs){document.getElementById('log-count').textContent=logs.length+' entries';if(!logs.length){document.getElementById('logs-body').innerHTML='<div class="empty">No log entries yet. Actions in the admin panel will appear here.</div>';return;}var html='<table style="font-size:12px"><thead><tr><th style="width:170px">Time</th><th style="width:60px">Level</th><th style="width:200px">Event</th><th>Data</th></tr></thead><tbody>';logs.forEach(function(l){var d=new Date(l.ts);var ts=d.toLocaleDateString()+' '+d.toLocaleTimeString();var dataStr=Object.keys(l.data||{}).length?JSON.stringify(l.data):'';html+='<tr style="background:'+LOG_LEVEL_BG[l.level||'info']+'">'+'<td style="font-family:monospace;font-size:11px;color:var(--cf-text-muted);white-space:nowrap">'+esc(ts)+'</td>'+'<td><span style="font-size:10px;font-weight:700;text-transform:uppercase;color:'+LOG_LEVEL_COLORS[l.level||'info']+'">'+esc(l.level||'info')+'</span></td>'+'<td style="font-family:monospace;font-size:11px">'+esc(l.event||'')+'</td>'+'<td style="font-family:monospace;font-size:11px;color:var(--cf-text-muted);word-break:break-all">'+esc(dataStr)+'</td>'+'</tr>';});html+='</tbody></table>';document.getElementById('logs-body').innerHTML=html;}
+document.getElementById('log-filter').addEventListener('click',function(e){var btn=e.target.closest('button[data-lvl]');if(!btn)return;logLevel=btn.dataset.lvl;document.querySelectorAll('#log-filter button').forEach(function(b){b.classList.remove('active-filter');b.style.fontWeight='';});btn.classList.add('active-filter');btn.style.fontWeight='600';loadLogs();});
 document.getElementById('refresh-logs-btn').addEventListener('click',loadLogs);
+
+/* ── 05 My Account ── */
+async function loadAccount(){var res=await api('/me');if(!res)return;var data=await res.json();document.getElementById('account-email').textContent=data.email;document.getElementById('account-name').textContent=data.name;document.getElementById('account-created').textContent=new Date(data.createdAt).toLocaleDateString();document.getElementById('account-files').textContent=data.fileCount+' files';}
+
+/* ── Init ── */
+window.addEventListener('load',function(){buildNav();showSection(navItems[0].id);});
 </script>
 <style>
 .active-filter{font-weight:600!important;border-style:solid!important;background:var(--cf-bg-hover)!important;color:var(--cf-text)!important}
 </style>
 </body>
 </html>`;
+  
   return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
 }

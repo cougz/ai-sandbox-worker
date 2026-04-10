@@ -1,4 +1,3 @@
-import { Buffer } from "node:buffer";
 import type { AuthRequest, OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 import { getSandbox } from "@cloudflare/sandbox";
 import { Workspace } from "@cloudflare/shell";
@@ -415,16 +414,22 @@ async function fetchAccessPublicKey(env: Env, kid: string): Promise<CryptoKey> {
   return crypto.subtle.importKey("jwk", jwk, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["verify"]);
 }
 
+/** Decode a base64url string to a Uint8Array (no Node.js Buffer required). */
+function fromBase64Url(s: string): Uint8Array {
+  const b64 = s.replace(/-/g, "+").replace(/_/g, "/").padEnd(s.length + (4 - s.length % 4) % 4, "=");
+  return Uint8Array.from(atob(b64), c => c.charCodeAt(0));
+}
+
 async function verifyAccessToken(env: Env, token: string): Promise<Record<string, string>> {
   const parts = token.split(".");
   if (parts.length !== 3) throw new Error("Invalid JWT");
-  const header  = JSON.parse(Buffer.from(parts[0], "base64url").toString());
-  const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString());
+  const header  = JSON.parse(new TextDecoder().decode(fromBase64Url(parts[0])));
+  const payload = JSON.parse(new TextDecoder().decode(fromBase64Url(parts[1])));
   const key = await fetchAccessPublicKey(env, header.kid);
   const valid = await crypto.subtle.verify(
     "RSASSA-PKCS1-v1_5", key,
-    Buffer.from(parts[2], "base64url"),
-    Buffer.from(`${parts[0]}.${parts[1]}`),
+    fromBase64Url(parts[2]),
+    new TextEncoder().encode(`${parts[0]}.${parts[1]}`),
   );
   if (!valid) throw new Error("JWT signature invalid");
   if (payload.exp < Math.floor(Date.now() / 1000)) throw new Error("JWT expired");

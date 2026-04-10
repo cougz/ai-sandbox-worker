@@ -16,21 +16,16 @@ import { buildBuiltinToolDefs } from "./tool-defs";
 import type { Props } from "./workers-oauth-utils";
 
 // ─── Env ──────────────────────────────────────────────────────────────────────
+// Extends the auto-generated Cloudflare.Env (worker-configuration.d.ts) so that
+// binding types (DO generics, KV, R2, etc.) are always kept in sync with wrangler.jsonc.
+// Only additions not emitted by `wrangler types` are declared here.
 
-export interface Env {
-  // Bindings
-  LOADER: WorkerLoader;
-  SandboxAgent: DurableObjectNamespace;
-  MCP_OBJECT: DurableObjectNamespace;   // alias for SandboxAgent — required by OAuthProvider
-  Sandbox: DurableObjectNamespace;      // container-backed DO for the /dash terminal
-  STORAGE?: R2Bucket;
-  USER_REGISTRY: KVNamespace;
-  OAUTH_KV: KVNamespace;
-  WORKSPACE_DB: D1Database;
-  // Vars
-  PUBLIC_URL: string;
-  ADMIN_EMAILS: string;  // Comma-separated list of admin emails
-  // Secrets
+export interface Env extends Cloudflare.Env {
+  // Container-backed DO — not emitted by `wrangler types` (class re-exported from @cloudflare/sandbox)
+  Sandbox: DurableObjectNamespace;
+  // Runtime secrets — set via `wrangler secret put`, not in wrangler.jsonc bindings
+  ADMIN_EMAILS: string;
+  ADMIN_SECRET: string;
   ACCESS_CLIENT_ID: string;
   ACCESS_CLIENT_SECRET: string;
   ACCESS_TOKEN_URL: string;
@@ -113,6 +108,9 @@ function makeAgentWorkspace(db: D1Database, ns: string, storage: R2Bucket | unde
 }
 
 export class SandboxAgent extends McpAgent<Env, Record<string, never>, Props> {
+  // @ts-ignore — @modelcontextprotocol/sdk ships two structurally-identical McpServer
+  // declarations (top-level 1.28 vs agents-bundled 1.29); the types differ only in a
+  // private field name, so the cast is safe at runtime.
   server = new McpServer({ name: "ai-sandbox", version: "1.0.0" });
 
   // D1-backed workspace: keyed by the user's email so files persist across sessions.

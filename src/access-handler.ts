@@ -452,9 +452,9 @@ interface LogEntry {
 const LOG_TTL  = 7 * 24 * 60 * 60; // 7 days
 const LOG_KEY  = (ts: string) => `log:${ts}_${Math.random().toString(36).slice(2, 8)}`;
 
-function writeLog(
+export function writeLog(
   env: Env,
-  ctx: ExecutionContext,
+  ctx: { waitUntil(p: Promise<unknown>): void },
   level: LogLevel,
   event: string,
   data: Record<string, unknown> = {},

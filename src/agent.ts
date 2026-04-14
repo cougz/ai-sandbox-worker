@@ -11,7 +11,7 @@ import { stateTools } from "@cloudflare/shell/workers";
 import { createWorker } from "@cloudflare/worker-bundler";
 import { z } from "zod";
 import { domainTools } from "./tools/example";
-import { handleRequest, emailToNamespace, SHARED_NAMESPACE } from "./access-handler";
+import { handleRequest, emailToNamespace, SHARED_NAMESPACE, writeLog } from "./access-handler";
 import { buildBuiltinToolDefs } from "./tool-defs";
 import type { Props } from "./workers-oauth-utils";
 
@@ -138,11 +138,20 @@ export class SandboxAgent extends McpAgent<Env, Record<string, never>, Props> {
     ];
   }
 
+  // Log a tool invocation to the KV ring-buffer (same store as /api/logs).
+  private logTool(toolName: string): void {
+    writeLog(this.env, this.ctx, "info", "tool.call", {
+      tool: toolName,
+      user: this.props?.email ?? "anonymous",
+    });
+  }
+
   // Register a single user-defined tool on the MCP server.
   // Called both from loadUserTools() at init and from tool_create at runtime.
   registerUserTool(def: UserToolDef) {
     const zodSchema = buildZodSchema(def.schema);
     const handler = async (args: Record<string, unknown>) => {
+      this.logTool(def.name);
       const executor = new DynamicWorkerExecutor({ loader: this.env.LOADER, globalOutbound: null });
       const { result, logs, error } = await executor.execute(
         `(${def.code})(${JSON.stringify(args)})`,
@@ -261,6 +270,7 @@ export class SandboxAgent extends McpAgent<Env, Record<string, never>, Props> {
       toolDesc["run_code"],
       { code: z.string().describe("JavaScript to run. Can use state.*, shared.*, and codemode.*") },
       async ({ code }) => {
+        this.logTool("run_code");
         const executor = new DynamicWorkerExecutor({ loader: this.env.LOADER, globalOutbound: null });
         const { result, logs, error } = await executor.execute(code, this.makeProviders(this.workspace));
         return { content: [{ type: "text" as const, text: JSON.stringify({ result, logs: logs ?? [], error: error ?? null }, null, 2) }] };
@@ -278,6 +288,7 @@ export class SandboxAgent extends McpAgent<Env, Record<string, never>, Props> {
         ),
       },
       async ({ code, packages }) => {
+        this.logTool("run_bundled_code");
         const { modules: bundledModules } = await createWorker({
           files: {
             "src/entry.ts": Object.keys(packages ?? {}).map(p => `import "${p}";`).join("\n") || "export {}",
@@ -299,6 +310,7 @@ export class SandboxAgent extends McpAgent<Env, Record<string, never>, Props> {
         shared: z.boolean().default(false).describe("true = shared workspace, false = personal (default)"),
       },
       async ({ file, shared }) => {
+        this.logTool("get_url");
         const base = this.env.PUBLIC_URL.replace(/\/$/, "");
         const url = shared
           ? `${base}/view?shared=true&file=${encodeURIComponent(file)}`
@@ -323,6 +335,7 @@ export class SandboxAgent extends McpAgent<Env, Record<string, never>, Props> {
         global: z.boolean().optional().describe("Save to shared workspace (visible to all users) — default false (personal workspace)"),
       },
       async ({ name, description, schema, code, global }) => {
+        this.logTool("tool_create");
         const def: UserToolDef = { name, description, schema: schema ?? {}, code };
         const path = `/tools/${name}/tool.json`;
         const targetWs = global ? this.sharedWorkspace : this.workspace;
@@ -341,6 +354,7 @@ export class SandboxAgent extends McpAgent<Env, Record<string, never>, Props> {
       toolDesc["tool_list"],
       {},
       async () => {
+        this.logTool("tool_list");
         const builtIn = [
           "run_code", "run_bundled_code",
           "get_url",
@@ -383,6 +397,7 @@ export class SandboxAgent extends McpAgent<Env, Record<string, never>, Props> {
       toolDesc["tool_delete"],
       { name: z.string().describe("Name of the custom tool to delete") },
       async ({ name }) => {
+        this.logTool("tool_delete");
         const paths = [`/tools/${name}/tool.json`, `/tools/${name}.json`];
         for (const p of paths) {
           try {
@@ -400,6 +415,7 @@ export class SandboxAgent extends McpAgent<Env, Record<string, never>, Props> {
       toolDesc["tool_reload"],
       {},
       async () => {
+        this.logTool("tool_reload");
         await this.loadUserTools();
         return { content: [{ type: "text" as const, text: "Custom tools reloaded from shared and personal /tools/ workspaces." }] };
       }

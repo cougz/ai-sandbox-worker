@@ -134,14 +134,16 @@ export class ChatSession extends DurableObject<Env> {
   private buildOptions(publicOrigin: string, sandboxId: string, userConfig: ChatUserConfig) {
     const model = userConfig.model || DEFAULT_MODEL;
 
+    // Only include fields that OpenCode's config schema actually accepts.
+    // "oauth" inside MCP config and "models" inside provider are not valid fields
+    // and cause OpenCode to crash on startup with empty stderr.
     const mcpServers: Record<string, unknown> = {
       [MCP_SERVER_NAME]: {
         type:    "remote",
         url:     `${this.env.PUBLIC_URL}/mcp`,
         enabled: true,
-        oauth: {
-          redirectUri: `${publicOrigin}/chat/oauth/${sandboxId}/mcp/oauth/callback`,
-        },
+        // OAuth for this MCP server is handled by the OpenCode UI's built-in
+        // auth flow — no redirectUri config needed here.
       },
     };
 
@@ -161,10 +163,8 @@ export class ChatSession extends DurableObject<Env> {
             options: {
               baseURL: `${publicOrigin}/chat/ai/v1`,
               apiKey:  "workers-ai",
+              // No "models" dict — not a valid OpenCode provider config field.
             },
-            models: Object.fromEntries(
-              Object.entries(AVAILABLE_MODELS).map(([id, n]) => [id, { name: n }])
-            ),
           },
         },
         mcp: mcpServers,

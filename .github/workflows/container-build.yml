@@ -1,0 +1,69 @@
+name: Build & Push Container Image
+
+# Triggered automatically when anything that affects the container image changes.
+# Also supports manual dispatch (e.g. to force a rebuild after a base image update).
+#
+# After this workflow completes, the next Workers Builds deploy will pick up the
+# new image tag automatically via scripts/patch-container-image.js.
+#
+# Required GitHub Actions secrets:
+#   CLOUDFLARE_API_TOKEN  — token with "Cloudflare Workers Containers: Edit" permission
+#
+# Required GitHub Actions variables (Settings → Variables):
+#   CLOUDFLARE_ACCOUNT_ID — your Cloudflare account ID
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - chat-config/**
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: "Reason for manual rebuild"
+        required: false
+        default: "Manual trigger"
+
+jobs:
+  build-container:
+    name: Build & push ai-sandbox-chat
+    runs-on: ubuntu-latest          # GitHub-hosted runners ship Docker out of the box
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Tag format: vYYYY-MM-DD[-N] — lexical sort means the latest tag is always last,
+      # which is what patch-container-image.js relies on when it calls `slice(-1)[0]`.
+      - name: Derive image tag
+        id: tag
+        run: echo "value=v$(date -u +%Y-%m-%d)-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push container image
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          npx wrangler containers build . \
+            --push \
+            --tag "ai-sandbox-chat:${{ steps.tag.outputs.value }}"
+
+      - name: Summary
+        run: |
+          echo "### Container image pushed" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Image:** \`ai-sandbox-chat:${{ steps.tag.outputs.value }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "The next Workers Builds deploy will use this image automatically." >> "$GITHUB_STEP_SUMMARY"

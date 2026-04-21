@@ -210,52 +210,41 @@ wrangler secret put ACCESS_JWKS_URL
 
 ## CI/CD
 
-Deployment is split across two systems because Workers Builds (Cloudflare's CI/CD) runs in a K8s environment without Docker and therefore cannot build container images.
+Everything deploys through **Workers Builds** — it has Docker available and handles both the container image build and the Worker deploy in a single `wrangler deploy` run.
 
-### Workers Builds — Worker code + OpenCode UI bundle
-
-Triggered on every push to `main`. Configure in the Cloudflare dashboard under **Workers & Pages → your worker → Settings → Build & Deploy**:
+Configure in the Cloudflare dashboard under **Workers & Pages → your worker → Settings → Build & Deploy**:
 
 | Setting | Value |
 |---|---|
 | Build command | `npm run build-ui` |
-| Deploy command | `node scripts/patch-container-image.js && npx wrangler deploy --config wrangler.deploy.json` |
+| Deploy command | `npx wrangler deploy` |
 
-`build-ui` clones the OpenCode repo at the pinned commit (`public/opencode-ui/VERSION`), builds the SolidJS mount bundle with Vite, and outputs it to `public/opencode-ui/` where Wrangler picks it up via the `assets` binding.
+`build-ui` clones the OpenCode repo at the pinned commit (`public/opencode-ui/VERSION`), builds the SolidJS mount bundle with Vite, and outputs it to `public/opencode-ui/` where Wrangler serves it via the `assets` binding.
 
-`patch-container-image.js` replaces the local `./Dockerfile` reference in the config with the latest `ai-sandbox-chat` tag from the Cloudflare container registry, then writes `wrangler.deploy.json` for the deploy step.
+`wrangler deploy` then:
+1. Builds the Docker container image from `Dockerfile`
+2. Uploads the static assets from `public/`
+3. Deploys the Worker
 
-### GitHub Actions — Container image
+### GitHub Actions (optional cache pre-warming)
 
-Triggered automatically on push to `main` when `Dockerfile` or `chat-config/` changes. Uses a GitHub-hosted `ubuntu-latest` runner (Docker pre-installed).
+`.github/workflows/container-build.yml` exists to optionally pre-build the container image on `Dockerfile`/`chat-config/` changes, so Workers Builds can reuse the cached layers and deploy faster. It is **not required** — Workers Builds will build the image itself if no cache exists.
 
-**Required GitHub Actions secret** (Settings → Secrets and variables → Actions → Secrets):
+If you want to use it, add one secret in **GitHub → Settings → Secrets and variables → Actions**:
 
 | Name | Value |
 |---|---|
 | `CLOUDFLARE_API_TOKEN` | API token with **Workers Containers: Edit** permission |
 
-The account ID is read from `wrangler.jsonc` automatically — no variable needed.
-
-To trigger a rebuild without changing files, go to **Actions → Build & Push Container Image → Run workflow**.
-
-> The container image must exist in the registry before the first Workers Builds deploy succeeds. Either push a code change that modifies `Dockerfile` or `chat-config/`, or trigger the workflow manually.
-
 ---
 
 ## Deploy
 
+Workers Builds deploys automatically on every push to `main`. For a local deploy (requires Docker):
+
 ```bash
 npm install
-wrangler deploy      # local deploy (requires Docker for the container image build)
-```
-
-For subsequent deploys, use Workers Builds (automatic) or:
-
-```bash
-npm run build-ui
-node scripts/patch-container-image.js
-wrangler deploy --config wrangler.deploy.json
+npm run deploy   # runs build-ui then wrangler deploy
 ```
 
 ---

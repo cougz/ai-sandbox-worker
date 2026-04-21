@@ -23,13 +23,28 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     htop \
     net-tools \
     iputils-ping \
+    unzip \
     && rm -rf /var/lib/apt/lists/*
 
-# Install OpenCode (the binary that runs `opencode serve` inside the container)
-RUN curl -fsSL https://opencode.ai/install -o /tmp/install-opencode.sh \
-    && bash /tmp/install-opencode.sh \
-    && rm /tmp/install-opencode.sh \
-    && opencode --version
+# Install OpenCode by downloading the pinned release zip directly from GitHub.
+# We bypass the opencode.ai/install script because it performs a network call
+# to fetch the latest version metadata, which fails in the Workers Builds
+# Docker context. Downloading from github.com/releases works fine.
+ARG OPENCODE_VERSION=1.14.19
+RUN ARCH=$(uname -m) && \
+    case "${ARCH}" in \
+      x86_64)  OC_ARCH="x64"   ;; \
+      aarch64) OC_ARCH="arm64" ;; \
+      *) echo "Unsupported arch: ${ARCH}" && exit 1 ;; \
+    esac && \
+    curl -fsSL \
+      "https://github.com/anomalyco/opencode/releases/download/v${OPENCODE_VERSION}/opencode-linux-${OC_ARCH}.zip" \
+      -o /tmp/opencode.zip && \
+    unzip -q /tmp/opencode.zip -d /tmp/opencode-bin && \
+    mv /tmp/opencode-bin/opencode /usr/local/bin/opencode && \
+    chmod +x /usr/local/bin/opencode && \
+    rm -rf /tmp/opencode.zip /tmp/opencode-bin && \
+    opencode --version
 
 # Copy the default OpenCode config (provider/model/MCP are injected at runtime
 # by createOpencode() in chat-session.ts, which merges on top of this file)

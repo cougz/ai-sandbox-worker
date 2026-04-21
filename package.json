@@ -4,12 +4,8 @@
   "private": true,
   "scripts": {
     "dev": "wrangler dev",
-    "prebuild": "./script/build-opencode-ui",
-    "build": "echo 'Worker build: OpenCode UI bundle generated in prebuild'",
     "build-ui": "./script/build-opencode-ui",
-    "deploy:local": "wrangler deploy",
-    "deploy:ci": "node scripts/patch-container-image.js && wrangler deploy --config wrangler.deploy.json",
-    "container:build": "wrangler containers build . -p -t ai-sandbox-chat:v$(date +%Y-%m-%d)",
+    "deploy": "npm run build-ui && wrangler deploy",
     "types": "wrangler types"
   },
   "dependencies": {

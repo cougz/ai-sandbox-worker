@@ -153,14 +153,23 @@ export class ChatSession extends DurableObject<Env> {
       }
     }
 
-    // DEBUG: pass no config at all to test if OpenCode starts with container defaults.
-    // The container's opencode.jsonc will be used (port 4096, autoupdate: false, permissions).
-    // Provider + MCP will be configured manually through the UI once we confirm startup works.
-    void model; void mcpServers; // suppress unused warning
     return {
       port:      OPENCODE_PORT,
       directory: WORKSPACE_DIR,
-      // config intentionally omitted — testing whether OpenCode itself starts
+      config: {
+        // No "model" field — OpenCode discovers available models from GET /chat/ai/v1/models
+        // and lets the user pick. The Workers AI model IDs contain "/" which can confuse
+        // OpenCode's "{provider}/{model}" string parser when embedded in the config.
+        provider: {
+          "openai-compatible": {
+            options: {
+              baseURL: `${publicOrigin}/chat/ai/v1`,
+              apiKey:  "workers-ai",
+            },
+          },
+        },
+        mcp: mcpServers,
+      },
     };
   }
 

@@ -1,117 +1,90 @@
-# AI Sandbox Worker
+# AI Sandbox
 
-A multi-user AI agent sandbox deployed on Cloudflare Workers. Exposes an MCP server that lets any MCP-compatible client (OpenCode, Claude Desktop, Cursor, etc.) execute JavaScript in isolated V8 sandboxes, operate on a persistent per-user filesystem, and generate shareable HTML reports - all authenticated via Cloudflare Access.
+A multi-user AI coding sandbox deployed on Cloudflare Workers. Exposes two ways to interact with the same set of tools:
 
-Built on two of Cloudflare's newest primitives:
+- **`/chat`** — Browser-based OpenCode web UI running inside a Cloudflare Container per user, powered by **Kimi K2.6 via Workers AI** (default) with switchable models. No local setup required.
+- **`/mcp`** — MCP server for any external MCP-compatible client (OpenCode TUI, Claude Desktop, Cursor, etc.) connecting over HTTPS with OAuth.
 
-- **[Dynamic Workers](https://developers.cloudflare.com/dynamic-workers/)** - spins up a fresh, isolated Worker sandbox on every `run_code` call (~2ms startup). No shared state between executions. Each sandbox gets only the bindings you explicitly pass in.
-- **[Code Mode (`@cloudflare/codemode`)](https://developers.cloudflare.com/agents/api-reference/codemode/)** - instead of calling tools one at a time, the LLM writes an async JavaScript function that orchestrates multiple tools with real logic (conditionals, loops, error handling). Code runs inside the Dynamic Worker sandbox; tool calls are dispatched back to the host via Workers RPC.
+Both interfaces use the same execution primitives, the same persistent workspace, and the same custom tools. Adding a tool via `/chat` makes it immediately available in a local OpenCode session, and vice versa.
+
+Built on Cloudflare-native primitives:
+
+- **[Dynamic Workers](https://developers.cloudflare.com/dynamic-workers/)** — isolated V8 sandbox per `run_code` call (~2ms startup), no shared state between executions
+- **[Code Mode (`@cloudflare/codemode`)](https://developers.cloudflare.com/agents/api-reference/codemode/)** — the LLM writes a JavaScript function that orchestrates multiple tools with real logic; runs inside the sandbox; tool calls dispatched back to the host via Workers RPC
+- **[Cloudflare Containers](https://developers.cloudflare.com/containers/)** — one container per user for `/chat`, runs `opencode serve` with the Workers AI provider and the MCP server pre-configured
+
+---
 
 ## Table of Contents
 
 - [Architecture](#architecture)
 - [Prerequisites](#prerequisites)
 - [One-time infrastructure setup](#one-time-infrastructure-setup)
-- [Cloudflare Access setup](#cloudflare-access-setup-zero-trust-dashboard)
+- [Cloudflare Access setup](#cloudflare-access-setup)
 - [Secrets](#secrets)
-- [Environment variables](#environment-variables-wranglersonc--vars)
+- [CI/CD](#cicd)
 - [Deploy](#deploy)
-- [Connecting OpenCode](#connecting-opencode)
+- [Chat interface (`/chat`)](#chat-interface-chat)
+- [MCP interface (`/mcp`)](#mcp-interface-mcp)
+- [Dashboard (`/dash`)](#dashboard-dash)
 - [MCP tools](#mcp-tools)
-- [Dashboard](#dashboard-dash)
 - [Adding domain tools](#adding-domain-tools)
 - [Report generation](#report-generation)
-- [Migration from legacy admin panel](#migration-from-legacy-admin-panel)
-- [Future Improvements](#future-improvements)
+
+---
 
 ## Architecture
 
 ```
-OpenCode / MCP client
-        │
-        │  MCP over HTTPS (OAuth 2.0)
-        ▼
-┌─────────────────────────────────────────┐
-│          Cloudflare Worker              │
-│                                         │
-│  OAuthProvider                          │
-│  ├── /mcp      → SandboxAgent DO        │
-│  ├── /authorize → Cloudflare Access     │
-│  ├── /callback  → Access OIDC callback  │
-│  ├── /view      → Workspace file server │
-│  └── /dash      → Unified dashboard     │
-│       ├── Admin view (full access)      │
-│       └── User view (limited access)    │
-└─────────────────────────────────────────┘
-        │
-        ├── Durable Object (SandboxAgent) - one per MCP session
-        │     └── Dynamic Worker Loader  - isolated V8 sandboxes (via @cloudflare/codemode)
-        │
-        ├── D1 Database - persistent workspace files per user
-        ├── R2 Bucket   - large file spill-over
-        ├── KV (OAUTH_KV)     - OAuth tokens & state
-        └── KV (USER_REGISTRY) - user registry
+Browser (/chat)               OpenCode TUI / MCP client
+      │                                  │
+      │  HTTPS + CF Access               │  MCP over HTTPS (OAuth 2.0)
+      ▼                                  ▼
+┌─────────────────────────────────────────────────────────┐
+│                   Cloudflare Worker                     │
+│                                                         │
+│  /chat          → serves OpenCode embed page            │
+│  /chat/oc/*     → proxy to container port 4096          │
+│  /chat/oauth/*  → MCP OAuth callback proxy              │
+│  /chat/ai/v1/*  → Workers AI proxy (env.AI binding)     │
+│  /chat/api/*    → config & MCP status API               │
+│  /opencode-ui/* → static assets (JS/CSS bundle)        │
+│                                                         │
+│  /mcp           → SandboxAgent DO (MCP protocol)        │
+│  /authorize     → Cloudflare Access OIDC                │
+│  /callback      → Access OIDC callback                  │
+│  /view          → public workspace file server          │
+│  /dash          → admin/user dashboard                  │
+└──────────────────────────┬──────────────────────────────┘
+                           │
+           ┌───────────────┴────────────────┐
+           │                                │
+           ▼                                ▼
+   ChatSession DO                    SandboxAgent DO
+   (one per user)                    (one per MCP session)
+           │                                │
+           ▼                                │
+   Cloudflare Container                     │
+   (standard-2 per user)                   │
+   └─ opencode serve :4096                 │
+      ├─ provider: Workers AI              │
+      └─ mcp: ai-sandbox (/mcp) ──────────►│
+                                           │
+                               DynamicWorkerExecutor
+                               (isolated V8 sandbox)
+                                           │
+                    ┌──────────────────────┼──────────────┐
+                    ▼                      ▼              ▼
+              D1 (workspace)        R2 (storage)    KV (OAuth/users)
 ```
-
-### Role-Based Access Control
-
-The dashboard (`/dash`) uses **unified authentication via Cloudflare Access** with **role-based authorization**:
-
-- **All users** authenticate through Cloudflare Access (via One-Time PIN or Identity Provider)
-- **Role determination** happens server-side by checking the user's email against `ADMIN_EMAILS`
-- **Admins** see full dashboard with Users, Tools, Files, Logs, and My Account sections
-- **Regular users** see limited dashboard with Tools, Files, and My Account sections
-- **Server-side enforcement** - API endpoints return 403 for unauthorized operations
-
-### How Code Mode + Dynamic Workers fit together
-
-```
-MCP client sends a natural-language task
-        │
-        ▼
-   SandboxAgent (Durable Object)
-        │
-        │  LLM writes an async JS function using codemode.* tool calls
-        ▼
-   DynamicWorkerExecutor (from @cloudflare/codemode)
-        │  spins up an isolated Worker via the LOADER binding
-        ▼
-   ┌─────────────────────────────────────────────┐
-   │  Isolated V8 Sandbox (Dynamic Worker)        │
-   │                                             │
-   │  async () => {                              │
-   │    const data = await codemode.kvGet(key)  │
-   │    if (data) {                              │
-   │      await codemode.kvSet(key, transform)  │
-   │    }                                        │
-   │    return result                            │
-   │  }                                          │
-   │                                             │
-   │  ✗ No outbound network (globalOutbound:null)│
-   │  ✓ codemode.* → Workers RPC → host tools   │
-   └─────────────────────────────────────────────┘
-        │
-        │  Workers RPC (ToolDispatcher)
-        ▼
-   Host Worker - executes the real tool logic
-   (state.*, codemode.* - full env access)
-```
-
-**Key design decisions:**
-
-- `OAuthProvider` (from `@cloudflare/workers-oauth-provider`) wraps `McpAgent.serve()` - the [officially recommended pattern](https://github.com/cloudflare/ai) for authenticated MCP servers on Workers.
-- Workspaces are backed by **D1** (not the DO's ephemeral SQLite), so files persist across sessions.
-- The `/view` endpoint is **public** - report links can be shared with anyone without requiring login.
-- **Authentication is 100% Cloudflare Access** - no shared secrets, no API keys, role-based access controlled via email allowlist.
-
 
 ---
 
 ## Prerequisites
 
 - Cloudflare account on the **Workers Paid plan** (Dynamic Worker Loader requires it)
-- Wrangler CLI: `npm install -g wrangler`
 - Node.js 18+
+- Wrangler CLI: `npm install -g wrangler`
 
 ---
 
@@ -119,157 +92,154 @@ MCP client sends a natural-language task
 
 ### 1. KV namespace
 
-`OAUTH_KV` and `USER_REGISTRY` can share a single KV namespace. Key prefixes don't collide (`oauth:*` for OAuth state, `user:*` for user registry), so no new namespace is needed if you already have one.
-
-Create one if starting from scratch:
+`OAUTH_KV` and `USER_REGISTRY` share one namespace (key prefixes don't collide):
 
 ```bash
 wrangler kv namespace create USER_REGISTRY
-# → outputs an ID; set both OAUTH_KV and USER_REGISTRY to that ID in wrangler.jsonc
+# → paste the output ID for both OAUTH_KV and USER_REGISTRY in wrangler.jsonc
 ```
 
-### 2. Create the D1 workspace database
+### 2. D1 workspace database
 
 ```bash
 wrangler d1 create sandbox-workspaces
-# → outputs a database_id, paste it into wrangler.jsonc under WORKSPACE_DB
+# → paste the database_id into wrangler.jsonc under WORKSPACE_DB
 ```
 
-### 3. Create the R2 bucket
+### 3. R2 bucket
 
 ```bash
 wrangler r2 bucket create sandbox-storage
 ```
 
-### 4. Update `wrangler.jsonc` with the IDs from steps 1–2
+### 4. Update `wrangler.jsonc`
 
-Replace `REPLACE_WITH_OAUTH_KV_ID` and `REPLACE_WITH_D1_ID` with the values printed by the commands above.
-
-
+Replace the KV ID and D1 ID placeholders with the values from steps 1–2.
 
 ---
 
-## Cloudflare Access setup (Zero Trust dashboard)
+## Cloudflare Access setup
 
-Authentication uses **Cloudflare Access for SaaS (OIDC)**. This gives you an OAuth server backed by your existing Identity Provider (Google, Okta, etc.) or One-Time PIN without managing OAuth infrastructure yourself.
+The sandbox uses **two independent Access applications** — one for the browser UI, one for the MCP OAuth flow. They serve different purposes and can coexist on the same domain.
 
-### Step 1 - Configure One-Time PIN (Recommended for testing)
+### Application 1 — Browser UI (self-hosted)
 
-Zero Trust → Settings → Authentication → **Add a provider** → **One-time PIN**
+Protects `/dash` and `/chat` in the browser. Standard CF Access: user visits the URL, Access checks their session, injects `cf-access-authenticated-user-email` header.
 
-Or use your existing Identity Provider (Google, Okta, Azure AD, etc.).
-
-### Step 2 - Create an Access Application
-
-Zero Trust → Access → Applications → **Add an application** → **Self-hosted**
+**Zero Trust → Access → Applications → Add → Self-hosted**
 
 | Field | Value |
 |---|---|
-| Application name | `AI Sandbox Dashboard` |
-| Subdomain / Domain | `ai-sandbox` (or your domain) |
-| Path | `/dash` |
+| Application name | `AI Sandbox` |
+| Domain | `your-domain.com` |
+| Path | *(leave blank to protect the whole domain)* |
 
-Click **Next**.
+Add an **Allow** policy (emails ending in `@yourcompany.com`, or specific emails).
 
-### Step 3 - Add an Access Policy
+Then add **Bypass** policies for the paths that must be reachable without a browser session:
 
-Create an **Allow** policy:
-
-| Setting | Value |
+| Path | Reason |
 |---|---|
-| Policy name | `Allow Cloudflare Users` |
-| Action | Allow |
-| Include | Emails ending in: `@cloudflare.com` |
+| `/view*` | Public report links — intentionally unauthenticated |
+| `/chat/oauth/*` | MCP OAuth callbacks from the container |
+| `/chat/ai/*` | Workers AI proxy called by the container |
+| `/mcp*` | MCP protocol — has its own OAuth flow |
+| `/authorize*` | MCP OAuth start |
+| `/callback*` | MCP OAuth callback |
+| `/token*` | MCP OAuth token exchange |
+| `/register*` | MCP client registration |
 
-Add additional **Include** rules for specific admin emails if they don't match the domain pattern.
+> **Tip:** If you prefer to protect only specific paths rather than the whole domain, create separate self-hosted applications for `/dash*` and `/chat*` each with an Allow policy.
 
-Click **Save**.
+### Application 2 — MCP OAuth (SaaS / OIDC)
 
-### Step 4 - Create Access for SaaS application (for MCP OAuth)
+Required only for the **`/mcp` endpoint** — i.e. when connecting external MCP clients like OpenCode TUI or Claude Desktop. Not needed if you only use `/chat`.
 
-Zero Trust → Access → Applications → **Add an application** → **SaaS**
+**Zero Trust → Access → Applications → Add → SaaS**
 
 | Field | Value |
 |---|---|
 | Application name | `AI Sandbox MCP` |
 | Application type | `OIDC` |
-| Redirect URL | `https://<your-domain>/callback` |
+| Redirect URL | `https://your-domain.com/callback` |
 | Scopes | `openid`, `email`, `profile` |
 
-Click **Save**. Note the values on the next screen:
+Save and note the values shown:
 
-| Secret name | Where to find it |
+| Secret | Where to find it |
 |---|---|
-| `ACCESS_CLIENT_ID` | "Client ID" on the app page |
-| `ACCESS_CLIENT_SECRET` | "Client secret" |
-| `ACCESS_TOKEN_URL` | "Token endpoint" |
-| `ACCESS_AUTHORIZATION_URL` | "Authorization endpoint" |
-| `ACCESS_JWKS_URL` | "Key endpoint" |
+| `ACCESS_CLIENT_ID` | Client ID |
+| `ACCESS_CLIENT_SECRET` | Client secret |
+| `ACCESS_TOKEN_URL` | Token endpoint |
+| `ACCESS_AUTHORIZATION_URL` | Authorization endpoint |
+| `ACCESS_JWKS_URL` | Key endpoint |
 
-### Step 5 - Add a policy to the SaaS application
+Add the same **Allow** policy as Application 1.
 
-Add the same **Allow** policy as Step 3 (or restrict further as needed).
+> **If you only use `/chat`** and never connect external MCP clients, you can skip Application 2 entirely and leave the `ACCESS_*` secrets unset.
 
 ---
 
 ## Secrets
 
-Set secrets via `wrangler secret put <name>` after deploying. All required secrets are listed in the table below.
+Set via `wrangler secret put <name>` after the first deploy.
 
-| Secret | Description |
-|---|---|
-| `ADMIN_EMAILS` | Comma-separated list of admin email addresses. These users get full dashboard access; all other authenticated users get limited access. |
-| `ACCESS_CLIENT_ID` | Cloudflare Access for SaaS - Client ID (from Access for SaaS application setup) |
-| `ACCESS_CLIENT_SECRET` | Cloudflare Access for SaaS - Client secret (from Access for SaaS application setup) |
-| `ACCESS_TOKEN_URL` | Cloudflare Access for SaaS - Token endpoint (from Access for SaaS application setup) |
-| `ACCESS_AUTHORIZATION_URL` | Cloudflare Access for SaaS - Authorization endpoint (from Access for SaaS application setup) |
-| `ACCESS_JWKS_URL` | Cloudflare Access for SaaS - JWKS endpoint (from Access for SaaS application setup) |
-| `COOKIE_ENCRYPTION_KEY` | Random string for cookie signing (generate with: `openssl rand -hex 32`) |
+| Secret | Required | Description |
+|---|---|---|
+| `ADMIN_EMAILS` | Yes | Comma-separated admin email addresses. Admins see the full dashboard; all other authenticated users see a limited view. |
+| `COOKIE_ENCRYPTION_KEY` | Yes | Random string for signing session cookies. Generate: `openssl rand -hex 32` |
+| `ACCESS_CLIENT_ID` | MCP only | From Access for SaaS OIDC app (Application 2) |
+| `ACCESS_CLIENT_SECRET` | MCP only | From Access for SaaS OIDC app |
+| `ACCESS_TOKEN_URL` | MCP only | From Access for SaaS OIDC app |
+| `ACCESS_AUTHORIZATION_URL` | MCP only | From Access for SaaS OIDC app |
+| `ACCESS_JWKS_URL` | MCP only | From Access for SaaS OIDC app |
 
-**Example:**
+**Quick setup:**
 ```bash
-# Set each secret interactively
-wrangler secret put ADMIN_EMAILS
-# Enter: admin1@cloudflare.com,admin2@cloudflare.com
-
-wrangler secret put COOKIE_ENCRYPTION_KEY
-# Enter: (output from: openssl rand -hex 32)
+wrangler secret put ADMIN_EMAILS          # e.g. alice@example.com,bob@example.com
+wrangler secret put COOKIE_ENCRYPTION_KEY # openssl rand -hex 32
+# If using /mcp with external clients:
+wrangler secret put ACCESS_CLIENT_ID
+wrangler secret put ACCESS_CLIENT_SECRET
+wrangler secret put ACCESS_TOKEN_URL
+wrangler secret put ACCESS_AUTHORIZATION_URL
+wrangler secret put ACCESS_JWKS_URL
 ```
 
-**Note:** `ADMIN_SECRET` has been removed. Admin access is now controlled entirely via Cloudflare Access + `ADMIN_EMAILS` secret.
-
 ---
 
-## Environment variables (`wrangler.jsonc` → `vars`)
+## CI/CD
 
-| Variable | Default | Description |
-|---|---|---|
-| `PUBLIC_URL` | `https://ai-sandbox.cloudemo.org` | Base URL used to build shareable `/view` links from `get_url`. Update if you use a different domain. |
+Deployment is split across two systems because Workers Builds (Cloudflare's CI/CD) runs in a K8s environment without Docker and therefore cannot build container images.
 
----
+### Workers Builds — Worker code + OpenCode UI bundle
 
-## KV bindings
+Triggered on every push to `main`. Configure in the Cloudflare dashboard under **Workers & Pages → your worker → Settings → Build & Deploy**:
 
-| Binding | Purpose | Notes |
-|---|---|---|
-| `OAUTH_KV` | OAuth provider state (client registrations, tokens, auth codes) | Managed automatically by `@cloudflare/workers-oauth-provider` |
-| `USER_REGISTRY` | User listing - populated automatically on first login | Keys: `user:{email}` → `{email, name, createdAt}` |
+| Setting | Value |
+|---|---|
+| Build command | `npm run build-ui` |
+| Deploy command | `node scripts/patch-container-image.js && npx wrangler deploy --config wrangler.deploy.json` |
 
----
+`build-ui` clones the OpenCode repo at the pinned commit (`public/opencode-ui/VERSION`), builds the SolidJS mount bundle with Vite, and outputs it to `public/opencode-ui/` where Wrangler picks it up via the `assets` binding.
 
-## D1 binding
+`patch-container-image.js` replaces the local `./Dockerfile` reference in the config with the latest `ai-sandbox-chat` tag from the Cloudflare container registry, then writes `wrangler.deploy.json` for the deploy step.
 
-| Binding | Database name | Purpose |
-|---|---|---|
-| `WORKSPACE_DB` | `sandbox-workspaces` | Persistent workspace files per user (namespaced by email via `@cloudflare/shell`) |
+### GitHub Actions — Container image
 
----
+Triggered automatically on push to `main` when `Dockerfile` or `chat-config/` changes. Uses a GitHub-hosted `ubuntu-latest` runner (Docker pre-installed).
 
-## R2 binding
+**Required GitHub Actions secret** (Settings → Secrets and variables → Actions → Secrets):
 
-| Binding | Bucket name | Purpose |
-|---|---|---|
-| `STORAGE` | `sandbox-storage` | Large file spill-over for workspace (files > threshold are stored here automatically) |
+| Name | Value |
+|---|---|
+| `CLOUDFLARE_API_TOKEN` | API token with **Workers Containers: Edit** permission |
+
+The account ID is read from `wrangler.jsonc` automatically — no variable needed.
+
+To trigger a rebuild without changing files, go to **Actions → Build & Push Container Image → Run workflow**.
+
+> The container image must exist in the registry before the first Workers Builds deploy succeeds. Either push a code change that modifies `Dockerfile` or `chat-config/`, or trigger the workflow manually.
 
 ---
 
@@ -277,157 +247,219 @@ wrangler secret put COOKIE_ENCRYPTION_KEY
 
 ```bash
 npm install
-wrangler deploy
+wrangler deploy      # local deploy (requires Docker for the container image build)
+```
+
+For subsequent deploys, use Workers Builds (automatic) or:
+
+```bash
+npm run build-ui
+node scripts/patch-container-image.js
+wrangler deploy --config wrangler.deploy.json
 ```
 
 ---
 
-## Connecting OpenCode
+## Chat interface (`/chat`)
 
-Each user adds this to their `opencode.jsonc`:
+### Accessing the chat
+
+Visit `https://your-domain.com/chat`. Cloudflare Access will authenticate you (One-Time PIN, Google, or your configured IdP). Once logged in you land directly in the OpenCode web UI.
+
+On first load the Worker starts the OpenCode container for your user in the background. This takes ~10–15 seconds on a cold start; the UI shows a loading state until the server is ready.
+
+### What you get
+
+- **Full OpenCode web UI** — same conversation interface as running `opencode web` locally
+- **Kimi K2.6** (262K context) as the default model, via Workers AI — no API key required
+- **All MCP tools** auto-connected — `run_code`, `run_bundled_code`, `get_url`, `tool_create`, `tool_list`, `tool_delete`, `tool_reload`, plus any custom tools you or your team have created
+- **Persistent workspace** — the same D1-backed workspace as the MCP interface; files written in `/chat` are readable via `/mcp` and vice versa
+
+### Switching models
+
+Open **Settings** in the OpenCode UI and change the model. Available options:
+
+| Model ID | Display name |
+|---|---|
+| `@cf/moonshotai/kimi-k2.6` | Kimi K2.6 (default, 262K ctx) |
+| `@cf/meta/llama-4-scout-17b-16e-instruct` | Llama 4 Scout 17B |
+| `@cf/meta/llama-3.3-70b-instruct-fp8-fast` | Llama 3.3 70B |
+| `@cf/qwen/qwen3-235b-a22b` | Qwen3 235B |
+| `@cf/openai/gpt-oss-120b` | GPT-OSS 120B |
+| `@cf/deepseek-ai/deepseek-r1-distill-llama-70b` | DeepSeek R1 Distill 70B |
+
+All models are served via **Workers AI** — billed to the same Cloudflare account as the Worker, no separate API keys.
+
+### Adding MCP servers
+
+Open **Settings → MCP** in the OpenCode UI to add additional remote MCP servers. The `ai-sandbox` server is pre-configured and cannot be removed.
+
+### MCP authentication
+
+On first use, the `ai-sandbox` MCP server shows as `needs_auth`. The OpenCode UI will prompt you to authenticate — this opens the standard Cloudflare Access login flow in a new tab. After authenticating once, the token is stored in the container and subsequent sessions connect automatically.
+
+---
+
+## MCP interface (`/mcp`)
+
+For connecting external MCP clients (OpenCode TUI, Claude Desktop, Cursor, etc.).
+
+### OpenCode TUI
+
+Add to `opencode.jsonc`:
 
 ```jsonc
 {
   "mcp": {
     "ai-sandbox": {
       "type": "remote",
-      "url": "https://<your-domain>/mcp"
+      "url": "https://your-domain.com/mcp"
     }
   }
 }
 ```
 
-**First time only** - run the auth flow:
+Authenticate once:
 
 ```bash
 opencode mcp auth ai-sandbox
 ```
 
-A browser window opens → Cloudflare Access login → token stored in `~/.local/share/opencode/mcp-auth.json` → all future sessions are automatic.
+A browser window opens → Cloudflare Access login → token saved to `~/.local/share/opencode/mcp-auth.json` → all future sessions are automatic.
 
----
+### Claude Desktop / other clients
 
-## MCP tools
+Add to `claude_desktop_config.json` (or equivalent):
 
-Once connected, the following tools are available in every session.
-
-### `run_code`
-
-Execute JavaScript in an isolated V8 sandbox powered by **Dynamic Workers** (~2ms startup). No outbound network access from the sandbox - all interaction with the outside world goes through typed `codemode.*` tool calls dispatched via **Workers RPC** back to the host.
-
-Inside the sandbox, the LLM writes an async function using **Code Mode** - it can chain tool calls with real logic rather than issuing them one at a time:
-
-```js
-async () => {
-  const raw = await codemode.kvGet({ key: "pipeline-data" });
-  const parsed = JSON.parse(raw);
-  const summary = parsed.runs.filter(r => r.status === "failed");
-  await codemode.kvSet({ key: "failures", value: JSON.stringify(summary) });
-  return summary.length;
+```json
+{
+  "mcpServers": {
+    "ai-sandbox": {
+      "type": "streamable-http",
+      "url": "https://your-domain.com/mcp"
+    }
+  }
 }
 ```
 
-Available namespaces:
-
-| Namespace | Description |
-|---|---|
-| `state.*` | Full filesystem: `readFile`, `writeFile`, `glob`, `searchFiles`, `replaceInFiles`, `diff`, `readJson`, `writeJson`, `walkTree`, and more |
-| `codemode.*` | Your custom TypeScript RPC tools (edit `src/tools/example.ts`) |
-
-Files written via `state.*` persist permanently across all sessions for that user (backed by D1).
-
-### `run_bundled_code`
-
-Same as `run_code` but bundles npm packages at runtime so the sandbox can `import` them. The Dynamic Worker sandbox receives the bundled modules injected as ES modules. Slower - prefer `run_code` for simple tasks.
-
-### `get_url`
-
-Returns a stable, shareable URL for any file in the workspace. Defaults to your personal workspace (`state.*`); set `shared=true` for the team shared workspace (`shared.*`). The link works without login (the `/view` endpoint is public).
+The first request will redirect to the OAuth flow.
 
 ---
 
 ## Dashboard (`/dash`)
 
-Visit `https://<your-domain>/dash` after authenticating via Cloudflare Access.
+Visit `https://your-domain.com/dash`. Role is determined server-side by checking your email against the `ADMIN_EMAILS` secret.
 
-The dashboard **automatically adapts** based on your role:
+| Section | Admin | User |
+|---|---|---|
+| Users — list, provision, wipe workspaces | ✓ | — |
+| Tools — view built-in and custom tools | ✓ | ✓ |
+| Files — browse workspaces | All users | Own only |
+| Logs — structured Worker events (7-day TTL) | ✓ | — |
+| My Account — email, first login, file count | ✓ | ✓ |
 
-### Admin View (email is in `ADMIN_EMAILS`)
+---
 
-**Navigation**: Users | Tools | Files | Logs | My Account
+## MCP tools
 
-- **Users**: List all authenticated users, provision new users, browse workspaces, wipe workspaces, remove users
-- **Tools**: View built-in and custom tools, edit JSON, browse tool directories, delete custom tools
-- **Files**: Browse any user's workspace or shared workspace, view/edit/delete files
-- **Logs**: View structured Worker events (7-day TTL)
-- **My Account**: Personal stats (email, name, first login, file count)
+### `run_code`
 
-### User View (email not in `ADMIN_EMAILS`)
+Execute JavaScript in an isolated V8 sandbox (~2ms startup). The LLM writes an async function using **Code Mode** — it can chain tool calls with real logic (conditionals, loops, error handling) rather than issuing them one at a time:
 
-**Navigation**: Tools | Files | My Account
+```js
+async () => {
+  const raw = await codemode.kvGet({ key: "pipeline-data" });
+  const parsed = JSON.parse(raw);
+  const failures = parsed.runs.filter(r => r.status === "failed");
+  await state.writeFile("/reports/failures.json", JSON.stringify(failures, null, 2));
+  return failures.length;
+}
+```
 
-- **Tools**: View built-in and custom tools (no edit/delete)
-- **Files**: Browse your personal workspace only (no other users' workspaces)
-- **My Account**: Personal stats (email, name, first login, file count)
+Available namespaces inside the sandbox:
 
-### Security Model
+| Namespace | Description |
+|---|---|
+| `state.*` | User workspace: `readFile`, `writeFile`, `glob`, `searchFiles`, `replaceInFiles`, `diff`, and more — persisted in D1 |
+| `shared.*` | Team shared workspace — same API as `state.*`, shared across all users |
+| `codemode.*` | Domain tools defined in `src/tools/example.ts` — runs in the host Worker with full binding access |
 
-- **Authentication**: Handled entirely by Cloudflare Access at the edge
-- **Authorization**: Server-side role checking on every request
-- **Data isolation**: Backend enforces workspace access; frontend only renders what it receives
-- **No secrets in frontend**: Role is never exposed to client-side code
+### `run_bundled_code`
+
+Same as `run_code` but bundles npm packages at runtime so the sandbox can `import` them. Slower — prefer `run_code` for tasks that don't need external packages.
+
+### `get_url`
+
+Returns a stable, shareable URL for any file in the workspace. The `/view` endpoint is public — no login required.
+
+```
+get_url({ file: "/reports/dashboard.html" })
+→ https://your-domain.com/view?user=alice@example.com&file=/reports/dashboard.html
+```
+
+### `tool_create` / `tool_list` / `tool_delete` / `tool_reload`
+
+Create, list, delete, and reload custom JavaScript tools stored in the workspace. Custom tools persist across sessions and are available in both the `/chat` and `/mcp` interfaces.
+
+```
+tool_create({
+  name: "fetch_jira",
+  description: "Fetch a Jira ticket by key",
+  schema: { key: { type: "string", description: "Jira ticket key e.g. PROJ-123" } },
+  code: `async ({ key }) => {
+    const resp = await fetch("https://jira.example.com/rest/api/2/issue/" + key, {
+      headers: { Authorization: "Bearer " + await state.readFile("/secrets/jira-token") }
+    });
+    return resp.json();
+  }`
+})
+```
 
 ---
 
 ## Adding domain tools
 
-Edit `src/tools/example.ts` to replace the stub KV tools with calls to your real services (databases, APIs, etc.):
+Edit `src/tools/example.ts` to replace the stub with calls to your real services:
 
 ```typescript
 export const domainTools = {
   myQuery: {
     description: "Query my database",
     execute: async ({ sql }: { sql: string }) => {
-      // This runs in the HOST Worker, not the sandbox.
-      // Full access to env bindings, secrets, external APIs.
+      // Runs in the host Worker — full access to env bindings, secrets, external APIs
       return env.MY_D1.prepare(sql).all();
     },
   },
 };
 ```
 
-The LLM calls these as `codemode.myQuery({ sql: "..." })` inside the sandbox via Workers RPC. The sandbox never has direct database access - it only sees return values.
+The LLM calls these as `codemode.myQuery({ sql: "..." })` inside the sandbox via Workers RPC. The sandbox never has direct database access — it only sees return values.
 
 ---
 
 ## Report generation
 
-Generate reports from the sandbox and get a shareable link:
-
 ```
 User: "Analyse the pipeline data and create a dashboard"
 
-→ run_code writes /reports/pipeline-dashboard.html
-→ get_url returns: https://<your-domain>/view?user=alice@example.com&file=/reports/pipeline-dashboard.html
+→ run_code reads /data/pipeline.json, transforms it, writes /reports/pipeline-dashboard.html
+→ get_url returns: https://your-domain.com/view?user=alice@example.com&file=/reports/pipeline-dashboard.html
 ```
 
-The LLM can use any styling approach - write self-contained HTML with inline CSS and Chart.js, or store reusable design tokens in the workspace (e.g. `/templates/base.css`, `/templates/charts.js`) and read them back with `state.readFile` before composing the final report.
+The link works for anyone without login. The LLM can use any approach — self-contained HTML with inline CSS and Chart.js, or reusable templates stored in the workspace.
 
 ---
 
-## Future Improvements
+## Bindings reference
 
-See [ROADMAP.md](./ROADMAP.md) for planned enhancements and known limitations.
-
----
-
-## Migration from legacy admin panel
-
-If you were previously using `/admin` with `ADMIN_SECRET`:
-
-1. **Set `ADMIN_EMAILS`** as a secret: `wrangler secret put ADMIN_EMAILS` (comma-separated emails)
-2. **Remove `ADMIN_SECRET`** from Wrangler secrets: `wrangler secret delete ADMIN_SECRET`
-3. **Update Access Policy** to protect `/dash` instead of `/admin`
-4. **Update bookmarks** from `/admin` to `/dash`
-
-The dashboard will automatically detect your role based on email and show the appropriate interface.
+| Binding | Type | Purpose |
+|---|---|---|
+| `WORKSPACE_DB` | D1 | Persistent workspace files per user (namespaced by email) |
+| `STORAGE` | R2 | Large file spill-over for workspace files above threshold |
+| `OAUTH_KV` | KV | OAuth provider state (client registrations, tokens) |
+| `USER_REGISTRY` | KV | User registry — populated automatically on first login |
+| `AI` | Workers AI | Kimi K2.6 and other models for `/chat` — no API key |
+| `Sandbox` | Container DO | Cloudflare Container per user for `/chat` (standard-2) |
+| `CHAT_SESSION` | Durable Object | OpenCode lifecycle management per user |
+| `SandboxAgent` | Durable Object | MCP session handler (one per connected client) |
+| `LOADER` | Worker Loader | Dynamic Worker sandboxes for `run_code` |

@@ -1,16 +1,8 @@
 /**
  * ChatSession Durable Object
  *
- * One instance per user (keyed by email hash).  Manages the OpenCode server
- * lifecycle inside the Cloudflare Container and persists per-user configuration.
- *
- * Key design: ensureServer() fires off startup via ctx.waitUntil() and returns
- * IMMEDIATELY so the Worker is never blocked waiting for OpenCode to boot.
- * The container cold-start + OpenCode startup can take 60-90s; the Worker's
- * RPC timeout would kill a synchronous await long before that.
- *
- * The chat page shows a loading screen and polls /chat/status/{sandboxId} until
- * OpenCode is ready, then mounts the UI.
+ * One instance per user (keyed by email hash). Manages the OpenCode server
+ * lifecycle inside the Cloudflare Container and persists per-user config.
  */
 
 import { DurableObject } from "cloudflare:workers";
@@ -43,19 +35,33 @@ export interface ChatUserConfig {
   mcpServers: Record<string, { url: string; enabled: boolean }>;
 }
 
+export interface ServerStatus {
+  state: "idle" | "starting" | "ready" | "failed";
+  log: string[];          // timestamped log lines surfaced in the loading screen
+  error?: string;         // last error message if state === "failed"
+  startedAt?: string;     // ISO timestamp when startup began
+  readyAt?: string;       // ISO timestamp when OpenCode became ready
+}
+
 interface CachedServer {
   server:       OpencodeServer;
   publicOrigin: string;
 }
 
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+function ts(): string {
+  return new Date().toISOString().slice(11, 23); // HH:MM:SS.mmm
+}
+
 // ─── ChatSession DO ───────────────────────────────────────────────────────────
 
 export class ChatSession extends DurableObject<Env> {
-  /** Fully started servers (createOpencodeServer resolved). */
   private servers          = new Map<string, CachedServer>();
-  /** Sandbox IDs whose startup is currently in progress. */
   private startupInProgress = new Set<string>();
   private publicOrigins    = new Map<string, string>();
+  /** Per-sandbox status + log ring (last 30 lines). */
+  private statuses         = new Map<string, ServerStatus>();
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private get sandboxNs(): any {
@@ -63,7 +69,41 @@ export class ChatSession extends DurableObject<Env> {
     return (this.env as any).Sandbox;
   }
 
-  // ── Config ─────────────────────────────────────────────────────────────────
+  // ── Logging helpers ─────────────────────────────────────────────────────────
+
+  private log(sandboxId: string, msg: string): void {
+    const line = `[${ts()}] ${msg}`;
+    console.log(`[ChatSession:${sandboxId.slice(0, 12)}] ${msg}`);
+    const s = this.getOrInitStatus(sandboxId);
+    s.log.push(line);
+    if (s.log.length > 30) s.log.shift();
+  }
+
+  private getOrInitStatus(sandboxId: string): ServerStatus {
+    if (!this.statuses.has(sandboxId)) {
+      this.statuses.set(sandboxId, { state: "idle", log: [] });
+    }
+    return this.statuses.get(sandboxId)!;
+  }
+
+  // ── Status (polled by the loading screen) ──────────────────────────────────
+
+  getStatus(sandboxId: string): ServerStatus {
+    const cached = this.statuses.get(sandboxId);
+    if (!cached) {
+      // DO was evicted and restarted — in-memory state is gone
+      return {
+        state: "idle",
+        log: [`[${ts()}] DO state not found — may have been evicted. Will retry.`],
+      };
+    }
+    // Sync state flags with maps in case they diverged
+    if (this.servers.has(sandboxId))           cached.state = "ready";
+    else if (this.startupInProgress.has(sandboxId)) cached.state = "starting";
+    return cached;
+  }
+
+  // ── Config builder ──────────────────────────────────────────────────────────
 
   private buildOptions(publicOrigin: string, sandboxId: string, userConfig: ChatUserConfig) {
     const model = userConfig.model || DEFAULT_MODEL;
@@ -123,63 +163,87 @@ export class ChatSession extends DurableObject<Env> {
     return updated;
   }
 
-  // ── Status ──────────────────────────────────────────────────────────────────
-
-  /** Returns "ready" | "starting" | "idle". */
-  getStatus(sandboxId: string): "ready" | "starting" | "idle" {
-    if (this.servers.has(sandboxId))          return "ready";
-    if (this.startupInProgress.has(sandboxId)) return "starting";
-    return "idle";
-  }
-
   // ── OpenCode lifecycle ───────────────────────────────────────────────────────
 
   /**
-   * Kick off OpenCode startup and return IMMEDIATELY.
-   *
-   * createOpencodeServer waits up to 180s for OpenCode to be ready (container
-   * cold-start + process startup). That far exceeds the Worker's RPC timeout, so
-   * we never await it from the Worker side. Instead we use ctx.waitUntil() to
-   * keep the DO alive while the startup runs in the background.
-   *
-   * Callers poll getStatus() or /chat/status/* to know when ready.
+   * Kick off OpenCode startup and return immediately.
+   * createOpencodeServer() waits up to 180s for the container + OpenCode to
+   * be ready — far beyond the Worker RPC timeout. We fire it via ctx.waitUntil
+   * so the DO stays alive. The chat page polls getStatus() to know when ready.
    */
   ensureServer(sandboxId: string, publicOrigin: string): void {
     this.publicOrigins.set(sandboxId, publicOrigin);
+    const status = this.getOrInitStatus(sandboxId);
 
-    // Already ready or already starting — nothing to do.
-    if (this.servers.has(sandboxId) || this.startupInProgress.has(sandboxId)) return;
+    if (this.servers.has(sandboxId)) {
+      this.log(sandboxId, "ensureServer called — server already ready, no-op");
+      return;
+    }
+    if (this.startupInProgress.has(sandboxId)) {
+      this.log(sandboxId, "ensureServer called — startup already in progress, no-op");
+      return;
+    }
 
+    // Reset failed state to allow retry
+    if (status.state === "failed") {
+      this.log(sandboxId, "Previous startup failed — retrying");
+      status.state = "idle";
+      status.error = undefined;
+    }
+
+    this.log(sandboxId, `ensureServer called — sandbox=${sandboxId}`);
+    this.log(sandboxId, `publicOrigin=${publicOrigin}`);
     this.startupInProgress.add(sandboxId);
+    status.state    = "starting";
+    status.startedAt = new Date().toISOString();
 
     const startup = this._doStart(sandboxId, publicOrigin)
       .then(() => {
         this.startupInProgress.delete(sandboxId);
-        console.log(`[ChatSession] OpenCode ready for ${sandboxId}`);
+        const s = this.getOrInitStatus(sandboxId);
+        s.state   = "ready";
+        s.readyAt = new Date().toISOString();
+        this.log(sandboxId, `OpenCode ready ✓`);
       })
       .catch((err: unknown) => {
         this.startupInProgress.delete(sandboxId);
-        console.error(`[ChatSession] OpenCode startup failed for ${sandboxId}:`, String(err));
+        const msg = err instanceof Error ? err.message : String(err);
+        const s = this.getOrInitStatus(sandboxId);
+        s.state = "failed";
+        s.error = msg;
+        this.log(sandboxId, `STARTUP FAILED: ${msg}`);
+        console.error(`[ChatSession] startup failed for ${sandboxId}:`, msg);
       });
 
-    // Keep the DO alive until startup resolves.
     this.ctx.waitUntil(startup);
   }
 
   private async _doStart(sandboxId: string, publicOrigin: string): Promise<void> {
+    this.log(sandboxId, "Reading user config from DO storage...");
     const userConfig = await this.getUserConfig();
-    const options    = this.buildOptions(publicOrigin, sandboxId, userConfig);
-    const sandbox    = getSandbox(this.sandboxNs, sandboxId);
+    this.log(sandboxId, `Config: model=${userConfig.model || DEFAULT_MODEL}`);
 
-    console.log(`[ChatSession] Starting OpenCode for ${sandboxId}...`);
-    // createOpencodeServer handles process reuse — safe to call concurrently.
+    const options = this.buildOptions(publicOrigin, sandboxId, userConfig);
+    this.log(sandboxId, `OpenCode options built — port=${options.port}, dir=${options.directory}`);
+    this.log(sandboxId, `Provider baseURL=${(options.config?.provider?.["openai-compatible"] as {options?:{baseURL?:string}})?.options?.baseURL ?? "?"}`);
+    this.log(sandboxId, `MCP servers: ${Object.keys(options.config?.mcp ?? {}).join(", ")}`);
+
+    this.log(sandboxId, "Calling getSandbox()...");
+    const sandbox = getSandbox(this.sandboxNs, sandboxId);
+    this.log(sandboxId, "Got sandbox stub — calling createOpencodeServer() (may take up to 180s)...");
+
     const server = await createOpencodeServer(sandbox, options);
     this.servers.set(sandboxId, { server, publicOrigin });
+    this.log(sandboxId, `createOpencodeServer() returned — port=${server.port}`);
   }
 
   resetInstance(sandboxId: string): void {
     this.servers.delete(sandboxId);
     this.startupInProgress.delete(sandboxId);
+    const s = this.getOrInitStatus(sandboxId);
+    s.state = "idle";
+    s.error = undefined;
+    this.log(sandboxId, "Instance reset");
   }
 
   // ── MCP management ──────────────────────────────────────────────────────────

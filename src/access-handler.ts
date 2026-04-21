@@ -284,9 +284,10 @@ export async function handleRequest(
     if (pathname === `/chat/status/${sandboxId}`) {
       const chatSessionId = env.CHAT_SESSION.idFromName(user.email);
       const chatSession   = env.CHAT_SESSION.get(chatSessionId);
-      const status = await (chatSession as unknown as { getStatus(id: string): string })
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const status = await (chatSession as unknown as { getStatus(id: string): any })
         .getStatus(sandboxId);
-      return Response.json({ status });
+      return Response.json(status);
     }
 
     // Proxy all /chat/oc/* to the OpenCode container
@@ -1527,10 +1528,15 @@ html,body{height:100%;overflow:hidden;background:#111;font-family:-apple-system,
 #chat-nav a:hover,#chat-nav a.active{color:#f5e6d3;background:rgba(255,72,1,.2)}
 #chat-nav .sep{color:rgba(245,230,211,.2);font-size:14px}
 #root{position:fixed;top:36px;left:0;right:0;bottom:0}
-#loader{position:fixed;top:36px;left:0;right:0;bottom:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:#111;gap:16px;color:rgba(245,230,211,.7);font-size:13px}
-.spinner{width:32px;height:32px;border:3px solid rgba(255,72,1,.2);border-top-color:#FF4801;border-radius:50%;animation:spin .8s linear infinite}
+#loader{position:fixed;top:36px;left:0;right:0;bottom:0;display:flex;flex-direction:column;align-items:center;justify-content:center;background:#111;gap:12px;color:rgba(245,230,211,.7);font-size:13px}
+.spinner{width:32px;height:32px;border:3px solid rgba(255,72,1,.2);border-top-color:#FF4801;border-radius:50%;animation:spin .8s linear infinite;flex-shrink:0}
 @keyframes spin{to{transform:rotate(360deg)}}
+#loader-title{font-size:14px;font-weight:500}
 #loader-msg{font-size:12px;color:rgba(245,230,211,.4)}
+#loader-log{width:min(600px,90vw);max-height:200px;overflow-y:auto;background:#0a0a0a;border:1px solid #2a1500;border-radius:6px;padding:10px 12px;font-family:monospace;font-size:11px;color:rgba(245,230,211,.55);line-height:1.5;display:none}
+#loader-error{color:#ff6b4a;font-size:12px;text-align:center;max-width:500px;display:none}
+#retry-btn{display:none;padding:6px 20px;background:#FF4801;color:#fff;border:none;border-radius:5px;font-size:12px;cursor:pointer;font-family:inherit}
+#retry-btn:hover{background:#e03e00}
 </style>
 </head>
 <body>
@@ -1542,9 +1548,12 @@ html,body{height:100%;overflow:hidden;background:#111;font-family:-apple-system,
   <span style="font-size:11px;color:rgba(245,230,211,.3);font-family:monospace">${escapeHtml(user.email)}</span>
 </nav>
 <div id="loader">
-  <div class="spinner"></div>
-  <div>Starting AI Sandbox…</div>
-  <div id="loader-msg">Spinning up your container</div>
+  <div class="spinner" id="loader-spinner"></div>
+  <div id="loader-title">Starting AI Sandbox…</div>
+  <div id="loader-msg">Contacting container…</div>
+  <div id="loader-error"></div>
+  <button id="retry-btn" onclick="location.reload()">Retry</button>
+  <div id="loader-log"></div>
 </div>
 <div id="root"></div>
 <script type="module">
@@ -1559,40 +1568,72 @@ html,body{height:100%;overflow:hidden;background:#111;font-family:-apple-system,
   const statusUrl  = ${JSON.stringify(`/chat/status/${sandboxId}`)};
   const directory  = ${JSON.stringify(directory)};
   let mounted = false;
+  const $title   = document.getElementById("loader-title");
+  const $msg     = document.getElementById("loader-msg");
+  const $logBox  = document.getElementById("loader-log");
+  const $errBox  = document.getElementById("loader-error");
+  const $spinner = document.getElementById("loader-spinner");
+  const $retry   = document.getElementById("retry-btn");
 
-  async function isReady() {
+  function showLog(lines) {
+    if (!lines || !lines.length) return;
+    $logBox.style.display = "block";
+    $logBox.innerHTML = lines.map(l => "<div>" + l.replace(/</g,"&lt;") + "</div>").join("");
+    $logBox.scrollTop = $logBox.scrollHeight;
+  }
+
+  async function pollStatus() {
     try {
-      // First check our status endpoint (fast — DO state check, no container request)
-      const s = await fetch(statusUrl, { signal: AbortSignal.timeout(4000) });
-      if (s.ok) {
-        const { status } = await s.json();
-        if (status === "ready") return true;
-        document.getElementById("loader-msg").textContent =
-          status === "starting" ? "OpenCode is starting…" : "Waiting for container…";
-        return false;
+      const r = await fetch(statusUrl, { signal: AbortSignal.timeout(5000) });
+      if (!r.ok) {
+        $msg.textContent = "Status check failed (" + r.status + ")";
+        return null;
       }
-    } catch { /* network error — keep retrying */ }
-    return false;
+      return await r.json();
+    } catch (e) {
+      $msg.textContent = "Network error: " + e.message;
+      return null;
+    }
   }
 
   async function mountUI() {
-    const loader = document.getElementById("loader");
-    loader.querySelector("div:nth-child(2)").textContent = "Loading interface…";
-    document.getElementById("loader-msg").textContent = "";
+    $title.textContent = "Loading interface…";
+    $msg.textContent = "";
     try {
       const { mount } = await import("/opencode-ui/opencode-mount.js");
       mount(document.getElementById("root"), { serverUrl, directory });
-      loader.style.display = "none";
+      document.getElementById("loader").style.display = "none";
       mounted = true;
     } catch (err) {
-      loader.querySelector("div:nth-child(2)").textContent = "Failed to load OpenCode UI";
-      document.getElementById("loader-msg").textContent = err.message;
+      $title.textContent = "Failed to load OpenCode UI";
+      $msg.textContent = err.message;
+      $retry.style.display = "inline-block";
     }
   }
 
   async function poll() {
     while (!mounted) {
-      if (await isReady()) { await mountUI(); return; }
+      const data = await pollStatus();
+      if (data) {
+        showLog(data.log);
+        if (data.state === "ready") {
+          await mountUI();
+          return;
+        } else if (data.state === "failed") {
+          $spinner.style.display = "none";
+          $title.textContent = "Startup failed";
+          $msg.textContent = "";
+          $errBox.style.display = "block";
+          $errBox.textContent = data.error || "Unknown error";
+          $retry.style.display = "inline-block";
+          return;
+        } else if (data.state === "starting") {
+          $msg.textContent = "OpenCode is starting…";
+        } else {
+          // idle — DO evicted or ensureServer not yet called
+          $msg.textContent = "Waiting for container…";
+        }
+      }
       await new Promise(r => setTimeout(r, 3000));
     }
   }

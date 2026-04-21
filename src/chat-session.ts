@@ -153,22 +153,35 @@ export class ChatSession extends DurableObject<Env> {
       }
     }
 
+    // Pass OPENCODE_CONFIG_CONTENT via customEnv instead of the `config` field.
+    //
+    // When `config` is passed, @cloudflare/sandbox extracts the apiKey from each
+    // provider and sets it as "{PROVIDER_ID.toUpperCase()}_API_KEY".  For our
+    // "openai-compatible" provider that becomes "OPENAI-COMPATIBLE_API_KEY" —
+    // a hyphenated env var name that the container agent rejects (non-POSIX),
+    // causing OpenCode to exit immediately with empty stderr.
+    //
+    // By passing the config as customEnv.OPENCODE_CONFIG_CONTENT ourselves we
+    // skip the key-extraction logic entirely.  No apiKey needed anyway — our
+    // /chat/ai/v1 proxy is the Worker's own endpoint and ignores auth headers.
+    const opencodeConfig = {
+      provider: {
+        "openai-compatible": {
+          options: {
+            baseURL: `${publicOrigin}/chat/ai/v1`,
+            // apiKey intentionally omitted — avoids OPENAI-COMPATIBLE_API_KEY
+          },
+        },
+      },
+      mcp: mcpServers,
+    };
+
     return {
       port:      OPENCODE_PORT,
       directory: WORKSPACE_DIR,
-      config: {
-        // No "model" field — OpenCode discovers available models from GET /chat/ai/v1/models
-        // and lets the user pick. The Workers AI model IDs contain "/" which can confuse
-        // OpenCode's "{provider}/{model}" string parser when embedded in the config.
-        provider: {
-          "openai-compatible": {
-            options: {
-              baseURL: `${publicOrigin}/chat/ai/v1`,
-              apiKey:  "workers-ai",
-            },
-          },
-        },
-        mcp: mcpServers,
+      // config: intentionally omitted — use customEnv below instead
+      env: {
+        OPENCODE_CONFIG_CONTENT: JSON.stringify(opencodeConfig),
       },
     };
   }

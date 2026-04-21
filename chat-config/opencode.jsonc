@@ -1,0 +1,16 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  // Provider, model, and MCP config are injected at runtime by createOpencode()
+  // in src/chat-session.ts — these static values are just fallback defaults.
+  "autoupdate": false,
+  "server": { "port": 4096 },
+  "share": "disabled",
+  "snapshot": false,
+  "permission": {
+    "edit": "allow",
+    "write": "allow",
+    "bash": "allow",
+    "webfetch": "allow",
+    "external_directory": "deny"
+  }
+}

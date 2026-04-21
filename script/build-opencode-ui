@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+#
+# Build the embeddable OpenCode web UI bundle.
+#
+# Clones the OpenCode repo (cached in .cache/opencode), checks out the pinned
+# commit from public/opencode-ui/VERSION, injects the custom mount entry point,
+# builds the library bundle, and copies output into public/opencode-ui/.
+#
+# Requirements: git, bun (auto-installed if missing)
+
+set -euo pipefail
+
+ROOT="$(git rev-parse --show-toplevel)"
+VERSION_FILE="$ROOT/public/opencode-ui/VERSION"
+CACHE_DIR="$ROOT/.cache/opencode"
+OUT_DIR="$ROOT/public/opencode-ui"
+MOUNT_DIR="$ROOT/script/opencode-mount"
+STAMP_FILE="$OUT_DIR/.build-stamp"
+MOUNT_INPUT_HASH="$(cat "$MOUNT_DIR/mount.tsx" "$MOUNT_DIR/vite.mount.config.ts" | shasum -a 256 | cut -d' ' -f1)"
+
+# Read pinned commit from VERSION file
+if [[ ! -f "$VERSION_FILE" ]]; then
+  echo "error: $VERSION_FILE not found" >&2
+  exit 1
+fi
+
+REPO=$(grep '^REPO=' "$VERSION_FILE" | cut -d= -f2)
+COMMIT=$(grep '^COMMIT=' "$VERSION_FILE" | cut -d= -f2)
+
+if [[ -z "$REPO" || -z "$COMMIT" ]]; then
+  echo "error: could not parse REPO and COMMIT from $VERSION_FILE" >&2
+  exit 1
+fi
+
+# Skip if already built from this commit + mount inputs
+STAMP_VALUE="$COMMIT:$MOUNT_INPUT_HASH"
+
+if [[ -f "$STAMP_FILE" ]] && [[ "$(cat "$STAMP_FILE")" == "$STAMP_VALUE" ]]; then
+  echo "opencode-ui: already built from ${COMMIT:0:12} with current mount inputs, skipping"
+  exit 0
+fi
+
+# Ensure bun is available (opencode uses catalog: deps which require bun)
+if ! command -v bun &>/dev/null; then
+  echo "opencode-ui: bun not found, installing to .cache/bun..."
+  BUN_DIR="$ROOT/.cache/bun"
+  mkdir -p "$BUN_DIR"
+  ARCH=$(uname -m)
+  case "$ARCH" in
+    x86_64)        BUN_ARCH="x64" ;;
+    aarch64|arm64) BUN_ARCH="aarch64" ;;
+    *) echo "error: unsupported architecture $ARCH" >&2; exit 1 ;;
+  esac
+  OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+  [[ "$OS" == "darwin" ]] && OS="darwin" || OS="linux"
+  BUN_ZIP="bun-${OS}-${BUN_ARCH}.zip"
+  BUN_URL="https://github.com/oven-sh/bun/releases/latest/download/${BUN_ZIP}"
+  curl -fsSL "$BUN_URL" -o "$BUN_DIR/$BUN_ZIP"
+  python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$BUN_DIR/$BUN_ZIP" "$BUN_DIR"
+  mv "$BUN_DIR/bun-${OS}-${BUN_ARCH}/bun" "$BUN_DIR/bun"
+  chmod +x "$BUN_DIR/bun"
+  rm -rf "$BUN_DIR/$BUN_ZIP" "$BUN_DIR/bun-${OS}-${BUN_ARCH}"
+  export PATH="$BUN_DIR:$PATH"
+fi
+
+echo "opencode-ui: building from $REPO @ ${COMMIT:0:12}..."
+
+# Clone or fetch
+if [[ -d "$CACHE_DIR/.git" ]]; then
+  echo "opencode-ui: updating cached repo..."
+  git -C "$CACHE_DIR" fetch origin --quiet
+else
+  echo "opencode-ui: cloning repo into .cache/opencode..."
+  mkdir -p "$(dirname "$CACHE_DIR")"
+  git clone --quiet "$REPO" "$CACHE_DIR"
+fi
+
+# Checkout pinned commit
+git -C "$CACHE_DIR" checkout --quiet "$COMMIT"
+
+# Inject custom mount files
+cp "$MOUNT_DIR/mount.tsx"            "$CACHE_DIR/packages/app/src/mount.tsx"
+cp "$MOUNT_DIR/vite.mount.config.ts" "$CACHE_DIR/packages/app/vite.mount.config.ts"
+
+# Install deps and build
+echo "opencode-ui: installing dependencies..."
+(cd "$CACHE_DIR/packages/app" && bun install --frozen-lockfile 2>/dev/null || bun install)
+
+echo "opencode-ui: building mount bundle..."
+(cd "$CACHE_DIR/packages/app" && bun x vite build --config vite.mount.config.ts)
+
+# Copy output, preserving VERSION
+echo "opencode-ui: copying bundle to $OUT_DIR..."
+rm -rf "$OUT_DIR/assets" "$OUT_DIR/chunks" "$OUT_DIR/opencode-mount."*
+rm -f  "$OUT_DIR/_headers" "$OUT_DIR/oc-theme-preload.js" "$OUT_DIR/site.webmanifest"
+rm -f  "$OUT_DIR/"*.png "$OUT_DIR/"*.ico "$OUT_DIR/"*.svg
+
+cp -r "$CACHE_DIR/packages/app/dist-mount/"* "$OUT_DIR/"
+
+# Write stamp so we can skip next time
+echo "$STAMP_VALUE" > "$STAMP_FILE"
+
+echo "opencode-ui: done"

@@ -1,6 +1,9 @@
 import type { AuthRequest, OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 import { getSandbox } from "@cloudflare/sandbox";
 import { Workspace } from "@cloudflare/shell";
+import { proxyChatRequest } from "./chat-proxy";
+import { handleChatAiProxy } from "./chat-ai-proxy";
+import { AVAILABLE_MODELS, type ChatUserConfig } from "./chat-session";
 import {
   addApprovedClient,
   createOAuthState,
@@ -210,6 +213,59 @@ export async function handleRequest(
 
   // ── Dashboard API ─────────────────────────────────────────────────────────
   if (pathname.startsWith("/api")) return handleApi(request, env, _ctx);
+
+  // ── Workers AI proxy (/chat/ai/* — checked before auth) ─────────────────
+  // Only reachable from the container (baseURL is set by ChatSession DO).
+  // The container communicates via the Worker's own network, not the public internet.
+  if (pathname.startsWith("/chat/ai/")) {
+    const aiResp = await handleChatAiProxy(request, env.AI);
+    if (aiResp) return aiResp;
+  }
+
+  // ── MCP OAuth callback (intentionally unauthenticated) ────────────────────
+  if (pathname.startsWith("/chat/oauth/")) {
+    const proxyResp = await proxyChatRequest(request, env);
+    if (proxyResp) return proxyResp;
+  }
+
+  // ── Chat routes (all require session auth) ────────────────────────────────
+  if (pathname === "/chat" || pathname.startsWith("/chat/")) {
+    const user = await authenticateRequest(request, env);
+    if (!user) return new Response("Unauthorized", { status: 401 });
+
+    // Stable sandbox ID derived from the authenticated email
+    const sandboxId = `chat-${emailToNamespace(user.email)}`;
+
+    // Serve the embedded OpenCode web UI
+    if (pathname === "/chat" || pathname === "/chat/") {
+      const sessionCookie = await createSessionCookie(user, env.COOKIE_ENCRYPTION_KEY);
+      // Eagerly start OpenCode in the container before returning the page so the
+      // UI doesn't hit a cold 503 on first load.
+      try {
+        const chatSessionId = env.CHAT_SESSION.idFromName(user.email);
+        const chatSession   = env.CHAT_SESSION.get(chatSessionId);
+        const origin = new URL(request.url).origin;
+        await (chatSession as unknown as { ensureServer(id: string, o: string): Promise<void> })
+          .ensureServer(sandboxId, origin);
+      } catch (err) {
+        writeLog(env, _ctx, "warn", "chat.ensure_server.fail", {
+          email: user.email, error: String(err),
+        });
+      }
+      return serveChatPage(user, sandboxId, request, sessionCookie);
+    }
+
+    // Proxy all /chat/oc/* to the OpenCode container
+    if (pathname.startsWith("/chat/oc/")) {
+      const proxyResp = await proxyChatRequest(request, env);
+      if (proxyResp) return proxyResp;
+    }
+
+    // Chat configuration/status API
+    if (pathname.startsWith("/chat/api/")) {
+      return handleChatApi(request, new URL(request.url), env, user);
+    }
+  }
 
   return new Response("Not found", { status: 404 });
 }
@@ -1346,4 +1402,144 @@ window.addEventListener('load',function(){buildNav();showSection(navItems[0].id)
       "Set-Cookie":   sessionCookie,
     },
   });
+}
+
+// ─── Chat page ────────────────────────────────────────────────────────────────
+// Serves the embedded OpenCode web UI at /chat.
+// The serverUrl and directory are baked into the HTML so the OpenCode mount
+// knows where to connect without additional round-trips.
+
+function serveChatPage(
+  user: AuthenticatedUser,
+  sandboxId: string,
+  request: Request,
+  sessionCookie: string,
+): Response {
+  const origin    = new URL(request.url).origin;
+  const serverUrl = `${origin}/chat/oc/${sandboxId}`;
+  const directory = "/home/user/workspace";
+
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AI Sandbox — Chat</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA2NiA2NiI+PHJlY3Qgd2lkdGg9IjY2IiBoZWlnaHQ9IjY2IiByeD0iOSIgZmlsbD0iI0ZGNDgwMSIvPjxnIHRyYW5zZm9ybT0idHJhbnNsYXRlKDAsMTgpIiBmaWxsPSJ3aGl0ZSI+PHBhdGggZD0iTTUyLjY4OCAxMy4wMjhjLS4yMiAwLS40MzcuMDA4LS42NTQuMDE1YS4zLjMgMCAwIDAtLjEwMi4wMjQuMzcuMzcgMCAwIDAtLjIzNi4yNTVsLS45MyAzLjI0OWMtLjQwMSAxLjM5Ny0uMjUyIDIuNjg3LjQyMiAzLjYzNC42MTguODc2IDEuNjQ2IDEuMzkgMi44OTQgMS40NWw1LjA0NS4zMDZhLjQ1LjQ1IDAgMCAxIC40MzUuNDEuNS41IDAgMCAxLS4wMjUuMjIzLjY0LjY0IDAgMCAxLS41NDcuNDI2bC01LjI0Mi4zMDZjLTIuODQ4LjEzMi01LjkxMiAyLjQ1Ni02Ljk4NyA1LjI5bC0uMzc4IDFhLjI4LjI4IDAgMCAwIC4yNDguMzgyaDE4LjA1NGEuNDguNDggMCAwIDAgLjQ2NC0uMzVjLjMyLTEuMTUzLjQ4Mi0yLjM0NC40OC0zLjU0IDAtNy4yMi01Ljc5LTEzLjA3Mi0xMi45MzMtMTMuMDcyTTQ0LjgwNyAyOS41NzhsLjMzNC0xLjE3NWMuNDAyLTEuMzk3LjI1My0yLjY4Ny0uNDItMy42MzQtLjYyLS44NzYtMS42NDctMS4zOS0yLjg5Ni0xLjQ1bC0yMy42NjUtLjMwNmEuNDcuNDcgMCAwIDEtLjM3NC0uMTk5LjUuNSAwIDAgMS0uMDUyLS40MzQuNjQuNjQgMCAwIDEgLjU1Mi0uNDI2bDIzLjg4Ni0uMzA2YzIuODM2LS4xMzEgNS45LTIuNDU2IDYuOTc1LTUuMjlsMS4zNjItMy42YS45LjkgMCAwIDAgLjA0LS40NzdDNDguOTk3IDUuMjU5IDQyLjc4OSAwIDM1LjM2NyAwYy02Ljg0MiAwLTEyLjY0NyA0LjQ2Mi0xNC43MyAxMC42NjVhNi45MiA2LjkyIDAgMCAwLTQuOTExLTEuMzc0Yy0zLjI4LjMzLTUuOTIgMy4wMDItNi4yNDYgNi4zMThhNy4yIDcuMiAwIDAgMCAuMTggMi40NzJDNC4zIDE4LjI0MSAwIDIyLjY3OSAwIDI4LjEzM3EwIC43NC4xMDYgMS40NTNhLjQ2LjQ2IDAgMCAwIC40NTcuNDAyaDQzLjcwNGEuNTcuNTcgMCAwIDAgLjU0LS40MTgiLz48L2c+PC9zdmc+">
+<link rel="stylesheet" href="/opencode-ui/opencode-mount.css">
+<style>
+html,body,#root{margin:0;padding:0;width:100%;height:100%;overflow:hidden}
+#root{display:flex;flex-direction:column}
+/* Dashboard quick-link nav bar */
+#chat-nav{position:fixed;top:0;left:0;right:0;height:36px;background:#1C0A00;display:flex;align-items:center;gap:12px;padding:0 16px;z-index:9999;border-bottom:1px solid #3a1500}
+#chat-nav a{font-size:11px;color:rgba(245,230,211,.6);text-decoration:none;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;padding:2px 8px;border-radius:4px;transition:all .12s}
+#chat-nav a:hover,#chat-nav a.active{color:#f5e6d3;background:rgba(255,72,1,.2)}
+#chat-nav .sep{color:rgba(245,230,211,.2);font-size:14px}
+#root{padding-top:36px}
+</style>
+</head>
+<body>
+<nav id="chat-nav">
+  <a href="/dash">Dashboard</a>
+  <span class="sep">|</span>
+  <a href="/chat" class="active">Chat</a>
+  <span class="sep">|</span>
+  <span style="font-size:11px;color:rgba(245,230,211,.4);font-family:monospace">${escapeHtml(user.email)}</span>
+</nav>
+<div id="root"></div>
+<script type="module">
+  import("/opencode-ui/opencode-mount.js")
+    .then(({ mount }) => {
+      mount(document.getElementById("root"), {
+        serverUrl:  ${JSON.stringify(serverUrl)},
+        directory:  ${JSON.stringify(directory)},
+      });
+    })
+    .catch((err) => {
+      document.getElementById("root").textContent = "Failed to load OpenCode UI: " + err.message;
+      console.error("[chat] Failed to load OpenCode UI:", err);
+    });
+</script>
+</body>
+</html>`;
+
+  return new Response(html, {
+    headers: {
+      "Content-Type": "text/html; charset=utf-8",
+      "Set-Cookie":   sessionCookie,
+    },
+  });
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+// ─── Chat API ─────────────────────────────────────────────────────────────────
+// /chat/api/* — configuration and MCP status endpoints.
+
+async function handleChatApi(
+  request: Request,
+  url: URL,
+  env: Env,
+  user: AuthenticatedUser,
+): Promise<Response> {
+  const method = request.method.toUpperCase();
+  const path   = url.pathname.replace(/^\/chat\/api/, "");
+
+  // Stub for the user's ChatSession DO
+  const chatSessionId = env.CHAT_SESSION.idFromName(user.email);
+  const chatSession   = env.CHAT_SESSION.get(chatSessionId) as unknown as {
+    getUserConfig(): Promise<ChatUserConfig>;
+    updateUserConfig(p: Partial<ChatUserConfig>): Promise<ChatUserConfig>;
+    getMcpStatuses(sandboxId: string): Promise<Record<string, unknown>>;
+    authenticateMcp(sandboxId: string, name: string): Promise<unknown>;
+  };
+
+  const sandboxId = `chat-${emailToNamespace(user.email)}`;
+
+  // GET /chat/api/config — return user's chat configuration
+  if (method === "GET" && path === "/config") {
+    const config = await chatSession.getUserConfig();
+    return jsonResp({ ...config, availableModels: AVAILABLE_MODELS });
+  }
+
+  // PATCH /chat/api/config — update user's chat configuration
+  if (method === "PATCH" && path === "/config") {
+    const body = await request.json<Partial<ChatUserConfig>>();
+    // Validate model if provided
+    if (body.model && !AVAILABLE_MODELS[body.model]) {
+      return jsonResp({ error: `Unknown model: ${body.model}` }, 400);
+    }
+    const updated = await chatSession.updateUserConfig(body);
+    return jsonResp(updated);
+  }
+
+  // GET /chat/api/models — list available Workers AI models
+  if (method === "GET" && path === "/models") {
+    return jsonResp({ models: AVAILABLE_MODELS });
+  }
+
+  // GET /chat/api/mcp — MCP server statuses
+  if (method === "GET" && path === "/mcp") {
+    try {
+      const statuses = await chatSession.getMcpStatuses(sandboxId);
+      return jsonResp(statuses);
+    } catch (err) {
+      return jsonResp({ error: String(err) }, 503);
+    }
+  }
+
+  // POST /chat/api/mcp/:name/auth — trigger MCP OAuth for a server
+  const authMatch = path.match(/^\/mcp\/([^/]+)\/auth$/);
+  if (method === "POST" && authMatch) {
+    const name = decodeURIComponent(authMatch[1]);
+    try {
+      const result = await chatSession.authenticateMcp(sandboxId, name);
+      return jsonResp(result);
+    } catch (err) {
+      return jsonResp({ error: String(err) }, 502);
+    }
+  }
+
+  return jsonResp({ error: "Not found" }, 404);
 }

@@ -9,22 +9,29 @@
 
   "durable_objects": {
     "bindings": [
-      { "name": "SandboxAgent", "class_name": "SandboxAgent" },
-      { "name": "MCP_OBJECT",   "class_name": "SandboxAgent" },
-      { "name": "Sandbox",      "class_name": "Sandbox" }
+      { "name": "SandboxAgent",  "class_name": "SandboxAgent" },
+      { "name": "MCP_OBJECT",    "class_name": "SandboxAgent" },
+      { "name": "Sandbox",       "class_name": "Sandbox" },
+      { "name": "CHAT_SESSION",  "class_name": "ChatSession" }
     ]
   },
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["SandboxAgent"] },
-    { "tag": "v2", "new_sqlite_classes": ["Sandbox"] }
+    { "tag": "v2", "new_sqlite_classes": ["Sandbox"] },
+    { "tag": "v3", "new_sqlite_classes": ["ChatSession"] }
   ],
 
-  // Cloudflare Container backing the interactive terminal in /dash
+  // Workers AI binding — used by the /chat/ai/* proxy so the container's OpenCode
+  // can call Kimi K2.6 (and other Workers AI models) without a separate API token.
+  "ai": { "binding": "AI" },
+
+  // Cloudflare Container for the /chat OpenCode sessions (one per user).
+  // standard-2 provides enough memory for OpenCode + active LLM conversations.
   "containers": [
     {
       "class_name": "Sandbox",
       "image": "./Dockerfile",
-      "instance_type": "lite",
+      "instance_type": "standard-2",
       "max_instances": 50
     }
   ],
@@ -46,6 +53,18 @@
   "vars": {
     "PUBLIC_URL": "https://ai-sandbox.cloudemo.org"
   },
+
+  // Static assets for the embedded OpenCode web UI (JS/CSS bundle built by
+  // script/build-opencode-ui, output to public/opencode-ui/).
+  // Served at /opencode-ui/opencode-mount.js and /opencode-ui/opencode-mount.css
+  // without running Worker code — the Worker handles /chat (authenticated page).
+  //
+  // Workers Builds build command: npm run build-ui
+  // Workers Builds deploy command: node scripts/patch-container-image.js && wrangler deploy --config wrangler.deploy.json
+  //
+  // Container image must be built separately (Docker required):
+  //   npm run container:build
+  "assets": { "directory": "./public" },
 
   // Secrets — set after deploy:
   //

@@ -4,6 +4,9 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 // Re-export Sandbox DO class — required for the container Durable Object binding
 export { Sandbox } from "@cloudflare/sandbox";
 
+// Re-export ChatSession DO — required for the CHAT_SESSION Durable Object binding
+export { ChatSession } from "./chat-session";
+
 import { McpAgent } from "agents/mcp";
 import { DynamicWorkerExecutor, resolveProvider } from "@cloudflare/codemode";
 import { Workspace } from "@cloudflare/shell";
@@ -23,6 +26,12 @@ import type { Props } from "./workers-oauth-utils";
 export interface Env extends Cloudflare.Env {
   // Container-backed DO — not emitted by `wrangler types` (class re-exported from @cloudflare/sandbox)
   Sandbox: DurableObjectNamespace;
+  // ChatSession DO — manages OpenCode lifecycle per user for /chat
+  CHAT_SESSION: DurableObjectNamespace;
+  // Workers AI binding — used by /chat/ai/v1/* proxy (env.AI.run())
+  // Type is `Ai` from @cloudflare/workers-types; typed as any until `wrangler types` runs
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  AI: any;
   // Runtime secrets — set via `wrangler secret put`, not in wrangler.jsonc bindings
   ADMIN_EMAILS: string;
   ADMIN_SECRET: string;

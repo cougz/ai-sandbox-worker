@@ -232,54 +232,43 @@ export const domainTools = {
     },
   },
 
-  // Example: A trivial key-value store.
+  // ── DEPRECATED: KV stubs ──────────────────────────────────────────────────
+  // These exist to satisfy the codemode.* interface contract but do NOT persist
+  // data.  Use state.writeFile / state.readFile instead for durable storage.
+  // Kept as stubs (not removed) because @cloudflare/codemode auto-registers
+  // them — removing them from domainTools would require upstream changes.
+
   kvGet: {
     description:
-      "Retrieve a stored value by key. Returns null if not found. Params: { key: string }",
+      "DEPRECATED — does not persist data. Use state.readFile / state.readJson instead. Returns null for all keys.",
     execute: async ({ key }: { key: string }): Promise<string | null> => {
-      // TODO: replace with your real data store
-      // e.g. return env.MY_KV.get(key);
-      console.log(`[kvGet] key=${key}`);
-      return `stub-value-for-${key}`;
+      console.warn(`[kvGet] DEPRECATED stub called for key="${key}" — use state.readFile instead`);
+      return null;
     },
   },
 
   kvSet: {
     description:
-      "Store a string value under a key. Overwrites existing values. Params: { key: string, value: string }",
-    execute: async ({
-      key,
-      value,
-    }: {
-      key: string;
-      value: string;
-    }): Promise<void> => {
-      // TODO: replace with your real data store
-      // e.g. await env.MY_KV.put(key, value);
-      console.log(`[kvSet] ${key} = ${value}`);
+      "DEPRECATED — does not persist data. Use state.writeFile / state.writeJson instead. Silently discards.",
+    execute: async ({ key, value }: { key: string; value: string }): Promise<void> => {
+      console.warn(`[kvSet] DEPRECATED stub called for key="${key}" — use state.writeFile instead. Value discarded.`);
     },
   },
 
   kvList: {
     description:
-      "List all keys in the store, optionally filtered by prefix. Params: { prefix?: string }",
-    execute: async ({
-      prefix,
-    }: {
-      prefix?: string;
-    }): Promise<string[]> => {
-      // TODO: replace with your real data store
-      // e.g. const { keys } = await env.MY_KV.list({ prefix });
-      //      return keys.map(k => k.name);
-      return [`${prefix ?? ""}example-key-1`, `${prefix ?? ""}example-key-2`];
+      "DEPRECATED — does not persist data. Use state.glob instead. Always returns empty array.",
+    execute: async ({ prefix }: { prefix?: string }): Promise<string[]> => {
+      console.warn(`[kvList] DEPRECATED stub called with prefix="${prefix ?? ""}" — use state.glob instead`);
+      return [];
     },
   },
 
   kvDelete: {
-    description: "Delete a key from the store. No-op if the key does not exist. Params: { key: string }",
+    description:
+      "DEPRECATED — does not persist data. Use state.rm instead. No-op.",
     execute: async ({ key }: { key: string }): Promise<void> => {
-      // TODO: replace with your real data store
-      console.log(`[kvDelete] key=${key}`);
+      console.warn(`[kvDelete] DEPRECATED stub called for key="${key}" — use state.rm instead`);
     },
   },
 };

@@ -45,6 +45,8 @@ export function buildBuiltinToolDefs(domainToolNames: string[]): ToolDef[] {
         "                readable and writable by all users.",
         "                Use this to access shared templates, configs, and team resources.",
         `  codemode.*  — domain tools: ${codemodeList}`,
+        "               Note: kvGet/kvSet/kvList/kvDelete are deprecated stubs that",
+        "               do NOT persist data. Use state.* methods for durable storage.",
         "",
         "Files written via state.* persist in your personal workspace.",
         "Files written via shared.* are immediately visible to all team members.",

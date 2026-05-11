@@ -16,6 +16,12 @@ import { z } from "zod";
 import { domainTools } from "./tools/example";
 import { handleRequest, emailToNamespace, SHARED_NAMESPACE, writeLog } from "./access-handler";
 import { buildBuiltinToolDefs } from "./tool-defs";
+import {
+  clearProtection,
+  generateDicewarePassword,
+  listProtections,
+  setProtection,
+} from "./view-protect";
 import type { Props } from "./workers-oauth-utils";
 
 // ─── Env ──────────────────────────────────────────────────────────────────────
@@ -370,6 +376,7 @@ export class SandboxAgent extends McpAgent<Env, Record<string, never>, Props> {
           "get_url",
           "tool_create", "tool_list", "tool_delete", "tool_reload",
           "workspace_import", "workspace_export",
+          "protect_file", "unprotect_file", "list_protected_files",
         ];
         const readTools = async (ws: Workspace): Promise<Array<{ name: string; description: string; path: string }>> => {
           const out: Array<{ name: string; description: string; path: string }> = [];
@@ -583,6 +590,138 @@ export class SandboxAgent extends McpAgent<Env, Record<string, never>, Props> {
           };
         }
       }
+    );
+
+    // ── protect_file ──────────────────────────────────────────────────────────
+    // Adds (or rotates) a password on a workspace file so its /view URL prompts
+    // the recipient for the password before serving the file.  Backed by the
+    // same OAUTH_KV store as the dashboard's Files tab — both surfaces see the
+    // same protection state.
+    this.server.tool(
+      "protect_file",
+      toolDesc["protect_file"],
+      {
+        file:     z.string().describe("Workspace path, e.g. /reports/board-deck.html"),
+        password: z.string().optional().describe("Password to set. Omit for a server-generated 4-word diceware password (returned to you for sharing)."),
+        shared:   z.boolean().default(false).describe("true = file is in the shared workspace, false = personal workspace (default)"),
+      },
+      async ({ file, password, shared }) => {
+        this.logTool("protect_file");
+        const email     = this.props?.email ?? "anonymous";
+        const workspace = shared ? "shared" : email;
+        const isAdmin   = (this.env.ADMIN_EMAILS ?? "")
+          .toLowerCase().split(",").map(s => s.trim()).includes(email.toLowerCase());
+
+        // Generate a diceware password if the caller didn't supply one.
+        const generated = !password;
+        const pwd = password ?? generateDicewarePassword(4);
+
+        try {
+          const rec = await setProtection(this.env.OAUTH_KV, {
+            workspace, file,
+            password: pwd,
+            actorEmail: email,
+            actorIsAdmin: isAdmin,
+            rotate: false,
+          });
+          writeLog(this.env, this.ctx, "info", rec.rotatedAt ? "view.protect.rotate" : "view.protect.set",
+            { workspace, file, actor: email, source: "mcp" });
+          const base = this.env.PUBLIC_URL.replace(/\/$/, "");
+          const url = shared
+            ? `${base}/view?shared=true&file=${encodeURIComponent(file)}`
+            : `${base}/view?user=${encodeURIComponent(email)}&file=${encodeURIComponent(file)}`;
+          return { content: [{ type: "text" as const, text: JSON.stringify({
+            status: "ok",
+            action: rec.rotatedAt ? "rotated" : "protected",
+            file,
+            workspace: shared ? "shared" : "personal",
+            url,
+            password: pwd,
+            password_generated: generated,
+            created_at: rec.createdAt,
+            created_by: rec.createdBy,
+            rotated_at: rec.rotatedAt,
+            message: rec.rotatedAt
+              ? `Password rotated for ${file}. The URL is unchanged — share the new password with recipients.`
+              : `File ${file} is now protected. Share the URL and the password through separate channels.`,
+          }, null, 2) }] };
+        } catch (err) {
+          const code = (err as Error & { code?: string }).code;
+          return { content: [{ type: "text" as const, text: JSON.stringify({
+            status: "error",
+            error: code ?? "protect_failed",
+            message: (err as Error).message,
+          }, null, 2) }] };
+        }
+      },
+    );
+
+    // ── unprotect_file ────────────────────────────────────────────────────────
+    this.server.tool(
+      "unprotect_file",
+      toolDesc["unprotect_file"],
+      {
+        file:   z.string().describe("Workspace path of a previously-protected file"),
+        shared: z.boolean().default(false).describe("true = shared workspace, false = personal workspace (default)"),
+      },
+      async ({ file, shared }) => {
+        this.logTool("unprotect_file");
+        const email     = this.props?.email ?? "anonymous";
+        const workspace = shared ? "shared" : email;
+        const isAdmin   = (this.env.ADMIN_EMAILS ?? "")
+          .toLowerCase().split(",").map(s => s.trim()).includes(email.toLowerCase());
+        try {
+          const out = await clearProtection(this.env.OAUTH_KV, {
+            workspace, file, actorEmail: email, actorIsAdmin: isAdmin,
+          });
+          writeLog(this.env, this.ctx, "info", "view.protect.remove",
+            { workspace, file, actor: email, hadRecord: out.removed, source: "mcp" });
+          return { content: [{ type: "text" as const, text: JSON.stringify({
+            status: "ok",
+            action: "unprotected",
+            file,
+            removed: out.removed,
+            message: out.removed
+              ? `Protection removed from ${file}. The /view URL is now publicly viewable again.`
+              : `${file} had no protection record — nothing to remove.`,
+          }, null, 2) }] };
+        } catch (err) {
+          const code = (err as Error & { code?: string }).code;
+          return { content: [{ type: "text" as const, text: JSON.stringify({
+            status: "error",
+            error: code ?? "unprotect_failed",
+            message: (err as Error).message,
+          }, null, 2) }] };
+        }
+      },
+    );
+
+    // ── list_protected_files ──────────────────────────────────────────────────
+    this.server.tool(
+      "list_protected_files",
+      toolDesc["list_protected_files"],
+      {
+        shared: z.boolean().default(false).describe("Cosmetic — both personal and shared lists are always returned. Kept for symmetry with the other tools."),
+      },
+      async () => {
+        this.logTool("list_protected_files");
+        const email = this.props?.email ?? "anonymous";
+        const [personal, sharedMap] = await Promise.all([
+          listProtections(this.env.OAUTH_KV, email),
+          listProtections(this.env.OAUTH_KV, "shared"),
+        ]);
+        const fmt = (map: Record<string, { createdAt: string; createdBy: string; rotatedAt: string | null }>) =>
+          Object.entries(map).map(([file, m]) => ({
+            file,
+            created_at: m.createdAt,
+            created_by: m.createdBy,
+            rotated_at: m.rotatedAt,
+          }));
+        return { content: [{ type: "text" as const, text: JSON.stringify({
+          personal: fmt(personal),
+          shared:   fmt(sharedMap),
+        }, null, 2) }] };
+      },
     );
 
     // Auto-load any custom tools the user has saved in their workspace.

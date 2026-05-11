@@ -19,6 +19,21 @@ import {
 } from "./workers-oauth-utils";
 import { buildBuiltinToolDefs } from "./tool-defs";
 import { domainTools } from "./tools/example";
+import { SHARED_NAMESPACE as SHARED_NS, emailToNamespace as emailToNs } from "./namespace";
+import {
+  buildUnlockCookie,
+  checkUnlockCookie,
+  clearProtection,
+  createCsrfToken,
+  deleteProtectionUnchecked,
+  generateDicewarePassword,
+  getProtection,
+  listProtections,
+  setProtection,
+  verifyCsrfToken,
+  verifyProtection,
+  type ProtectionMetadata,
+} from "./view-protect";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -180,25 +195,16 @@ export async function handleRequest(
   }
 
   // ── Public: serve a workspace file ───────────────────────────────────────
+  // The endpoint is fully public for unprotected files (backward compatible).
+  // Files with a `protect:` record in OAUTH_KV require a password — the recipient
+  // is presented with an unlock page on first access, then receives a per-file
+  // HMAC cookie scoped to /view for 24h (see view-protect.ts).
   if (pathname === "/view") {
-    const isShared = searchParams.get("shared") === "true";
-    const file     = searchParams.get("file") ?? "/reports/dashboard.html";
+    return handleViewRequest(request, env, _ctx);
+  }
 
-    let workspace: Workspace;
-    if (isShared) {
-      workspace = makeSharedWorkspace(env);
-    } else {
-      const email = searchParams.get("user");
-      if (!email) return new Response("Missing ?user=EMAIL", { status: 400 });
-      workspace = makeWorkspace(email, env);
-    }
-
-    const content = await workspace.readFile(file);
-    if (content === null) return new Response(`File not found: ${file}`, { status: 404 });
-    const ext = file.split(".").pop()?.toLowerCase() ?? "txt";
-    return new Response(content, {
-      headers: { "Content-Type": CONTENT_TYPES[ext] ?? "text/plain; charset=utf-8" },
-    });
+  if (pathname === "/view/unlock" && request.method === "POST") {
+    return handleViewUnlock(request, env, _ctx);
   }
 
   // ── Unified dashboard ─────────────────────────────────────────────────────
@@ -415,14 +421,12 @@ function jsonResp(body: unknown, status = 200): Response {
 
 // ─── Workspace factory (D1-backed) ────────────────────────────────────────────
 
-// Fixed namespace for the team shared workspace — readable and writable by all users.
-export const SHARED_NAMESPACE = "team_shared";
-
-// Derives a valid Workspace namespace from an email address.
-// Must match the same function in agent.ts — both sides must agree on the namespace.
-export function emailToNamespace(email: string): string {
-  return "u_" + email.toLowerCase().replace(/[^a-z0-9]/g, "_").replace(/_+/g, "_").replace(/_$/, "").slice(0, 60);
-}
+// Re-export the shared namespace helpers so agent.ts and other callers keep
+// working without an import-path change.  The single source of truth lives in
+// ./namespace.ts so non-handler modules (e.g. view-protect.ts) can import
+// without pulling in the much larger access-handler.ts module.
+export const SHARED_NAMESPACE = SHARED_NS;
+export function emailToNamespace(email: string): string { return emailToNs(email); }
 
 // Module-level cache: Workspace registers itself in a WeakMap inside @cloudflare/shell
 // and throws if the same (sql-source, namespace) pair is created twice in one isolate.
@@ -940,9 +944,88 @@ async function handleApi(request: Request, env: Env, ctx: ExecutionContext): Pro
     
     const ws = wsName === "shared" ? makeSharedWorkspace(env) : makeWorkspace(wsName, env);
     try {
-      const entries = await ws.glob("/**/*") as Array<{ path: string; type: string; size: number; updatedAt: number }>;
-      return jsonResp(entries.filter((e) => e.type === "file").map((e) => ({ path: e.path, size: e.size, updatedAt: e.updatedAt })));
+      const [entries, protections] = await Promise.all([
+        ws.glob("/**/*") as Promise<Array<{ path: string; type: string; size: number; updatedAt: number }>>,
+        listProtections(env.OAUTH_KV, wsName),
+      ]);
+      const files = entries
+        .filter((e) => e.type === "file")
+        .map((e) => {
+          const meta = protections[e.path];
+          const base: { path: string; size: number; updatedAt: number; protection?: ProtectionMetadata } = {
+            path: e.path, size: e.size, updatedAt: e.updatedAt,
+          };
+          if (meta) base.protection = meta;
+          return base;
+        });
+      return jsonResp(files);
     } catch { return jsonResp([]); }
+  }
+
+  // POST /protect — set/rotate protection on a workspace file
+  // Body: { workspace, file, password, action: "set"|"rotate"|"remove" }
+  if (method === "POST" && path === "/protect") {
+    const body = await request.json<{
+      workspace?: string;
+      file?:      string;
+      password?:  string;
+      action?:    "set" | "rotate" | "remove";
+    }>().catch(() => ({} as Record<string, never>));
+
+    const wsName = body.workspace;
+    const file   = body.file;
+    const action = body.action ?? "set";
+
+    if (!wsName || !file) return jsonResp({ error: "Missing workspace or file" }, 400);
+    if ((action === "set" || action === "rotate") && !body.password) {
+      return jsonResp({ error: "Password required" }, 400);
+    }
+
+    // Non-admins can only protect files in their own workspace (or shared,
+    // where additional creator-only enforcement happens inside view-protect.ts).
+    if (user.role !== "admin" && wsName !== user.email && wsName !== "shared") {
+      return jsonResp({ error: "Forbidden" }, 403);
+    }
+
+    try {
+      if (action === "remove") {
+        const out = await clearProtection(env.OAUTH_KV, {
+          workspace: wsName, file,
+          actorEmail: user.email, actorIsAdmin: user.role === "admin",
+        });
+        writeLog(env, ctx, "info", "view.protect.remove", { workspace: wsName, file, actor: user.email, hadRecord: out.removed });
+        return jsonResp({ ok: true, action: "remove", removed: out.removed });
+      }
+      const rec = await setProtection(env.OAUTH_KV, {
+        workspace: wsName, file,
+        password: body.password!,
+        actorEmail: user.email, actorIsAdmin: user.role === "admin",
+        rotate: action === "rotate",
+      });
+      writeLog(env, ctx, "info", action === "rotate" ? "view.protect.rotate" : "view.protect.set",
+        { workspace: wsName, file, actor: user.email });
+      return jsonResp({
+        ok: true,
+        action,
+        createdAt: rec.createdAt,
+        createdBy: rec.createdBy,
+        rotatedAt: rec.rotatedAt,
+      });
+    } catch (err) {
+      const code = (err as Error & { code?: string }).code;
+      if (code === "forbidden") {
+        writeLog(env, ctx, "warn", "view.protect.forbidden", { workspace: wsName, file, actor: user.email });
+        return jsonResp({ error: (err as Error).message }, 403);
+      }
+      writeLog(env, ctx, "error", "view.protect.error", { workspace: wsName, file, error: String(err) });
+      return jsonResp({ error: String(err) }, 500);
+    }
+  }
+
+  // GET /protect/generate — return a server-generated diceware password.
+  // Convenience for the dashboard "generate" button so wordlists stay server-side.
+  if (method === "GET" && path === "/protect/generate") {
+    return jsonResp({ password: generateDicewarePassword(4) });
   }
 
   if (method === "GET" && path === "/files/read") {
@@ -1115,6 +1198,34 @@ tr:hover td{background:var(--cf-bg-hover)}
 .tree-dl{background:none;border:none;color:var(--cf-text-subtle);padding:1px 5px;opacity:0;cursor:pointer;font-size:12px;line-height:1;border-radius:3px;flex-shrink:0}
 .tree-row:hover .tree-dl{opacity:.6}
 .tree-dl:hover{opacity:1!important;color:var(--cf-orange)!important;background:rgba(255,72,1,.08)}
+.tree-lock{background:none;border:none;padding:1px 5px;cursor:pointer;font-size:12px;line-height:1;border-radius:3px;flex-shrink:0;color:var(--cf-text-subtle);opacity:0;transition:opacity .12s,color .12s}
+.tree-row:hover .tree-lock{opacity:.6}
+.tree-lock:hover{opacity:1!important;background:rgba(255,72,1,.08)}
+.tree-lock.protected{opacity:1!important;color:var(--cf-orange)}
+.tree-lock.protected:hover{color:var(--cf-orange)}
+/* Protection slide-out panel */
+.protect-backdrop{position:fixed;inset:0;background:rgba(28,10,0,.35);opacity:0;pointer-events:none;transition:opacity .18s;z-index:600}
+.protect-backdrop.open{opacity:1;pointer-events:auto}
+.protect-panel{position:fixed;top:0;right:-460px;width:440px;max-width:90vw;height:100vh;background:var(--cf-bg-card);border-left:1px solid var(--cf-border);box-shadow:-4px 0 18px rgba(82,16,0,.06);transition:right .22s;z-index:601;display:flex;flex-direction:column;overflow-y:auto}
+.protect-panel.open{right:0}
+.protect-hdr{padding:18px 22px 12px;border-bottom:1px solid var(--cf-border);display:flex;align-items:flex-start;justify-content:space-between;gap:12px}
+.protect-hdr-title{font-size:16px;font-weight:600;letter-spacing:-.01em;margin-bottom:2px}
+.protect-hdr-file{font-family:"SF Mono","Fira Code",monospace;font-size:11px;color:var(--cf-text-subtle);word-break:break-all}
+.protect-close{background:none;border:none;color:var(--cf-text-subtle);font-size:20px;line-height:1;cursor:pointer;padding:2px 6px;border-radius:3px}
+.protect-close:hover{color:var(--cf-text);background:var(--cf-bg-hover)}
+.protect-body{padding:18px 22px;flex:1}
+.protect-state{font-size:12px;color:var(--cf-text-muted);background:rgba(255,72,1,.06);border:1px solid rgba(255,72,1,.18);border-radius:6px;padding:10px 12px;margin-bottom:18px;line-height:1.55}
+.protect-state strong{color:var(--cf-text);font-weight:500}
+.protect-state.unprotected{background:rgba(235,213,193,.3);border-color:var(--cf-border)}
+.pwd-input-wrap{position:relative;margin-bottom:8px}
+.pwd-input-wrap input{padding-right:36px}
+.pwd-eye{position:absolute;right:6px;top:50%;transform:translateY(-50%);background:none;border:none;cursor:pointer;color:var(--cf-text-subtle);padding:4px;border-radius:3px;display:flex;align-items:center}
+.pwd-eye:hover{color:var(--cf-text);background:var(--cf-bg-hover)}
+.pwd-actions{display:flex;gap:6px;margin-bottom:14px;flex-wrap:wrap}
+.protect-divider{height:1px;background:var(--cf-border);margin:18px 0}
+.protect-section-label{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--cf-text-muted);margin-bottom:8px}
+.protect-error{color:var(--cf-error);font-size:12px;margin-top:6px}
+.protect-success{color:var(--cf-success);font-size:12px;margin-top:6px}
 .fb-action{background:var(--cf-bg-card);border:1px solid var(--cf-border);padding:14px 15px}
 .viewer-lbl{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--cf-text-muted);margin-bottom:5px}
 .viewer-filepath{font-family:"SF Mono","Fira Code",monospace;font-size:11px;color:var(--cf-text-subtle);margin-bottom:6px;min-height:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -1257,6 +1368,17 @@ tr:hover td{background:var(--cf-bg-hover)}
 
   </main>
 </div></div>
+<div class="protect-backdrop" id="protect-backdrop"></div>
+<aside class="protect-panel" id="protect-panel" aria-label="File protection">
+  <div class="protect-hdr">
+    <div>
+      <div class="protect-hdr-title">Password protection</div>
+      <div class="protect-hdr-file" id="protect-file">&mdash;</div>
+    </div>
+    <button class="protect-close" id="protect-close-btn" aria-label="Close">&times;</button>
+  </div>
+  <div class="protect-body" id="protect-body"></div>
+</aside>
 <div class="toast" id="toast"></div>
 <script>
 // User configuration injected by server
@@ -1395,8 +1517,87 @@ function editToolJson(toolJsonPath){var dir=toolJsonPath.substring(0,toolJsonPat
 async function populateWsSel(selectEmail){if(!IS_ADMIN)return;var sel=document.getElementById('ws-sel');var cur=selectEmail||sel.value||bWs;var res=await api('/users');if(!res)return;var users=await res.json();var opts='<option value="shared">Shared Workspace</option>';users.forEach(function(u){opts+='<option value="'+esc(u.email)+'">'+esc(u.email)+'</option>';});sel.innerHTML=opts;sel.value=cur;bWs=sel.value;}
 async function loadBrowserFiles(){var ws=document.getElementById('ws-sel').value||USER_EMAIL;bWs=ws;bFiles=[];resetViewer();document.getElementById('file-tree').innerHTML='<div class="empty">Loading\u2026</div>';var res=await api('/files?workspace='+encodeURIComponent(ws));if(!res)return;bFiles=await res.json();renderTree();if(pendingEditFile){var pef=pendingEditFile;pendingEditFile=null;await viewFile(pef);document.querySelectorAll('#file-tree .tree-row').forEach(function(r){if(r.dataset.path===pef)r.classList.add('selected');});}}
 function listDir(){var prefix=bPath==='/'?'/':bPath+'/';var seen=new Set(),dirs=[],files=[];bFiles.forEach(function(f){if(!f.path.startsWith(prefix))return;var rest=f.path.slice(prefix.length);if(!rest)return;var slash=rest.indexOf('/');if(slash===-1){if(!f.path.endsWith('/.keep'))files.push(f);}else{var d=rest.slice(0,slash);if(!seen.has(d)){seen.add(d);dirs.push(d);}}});return{dirs:dirs.sort(),files:files.sort(function(a,b){return a.path.localeCompare(b.path);})};}
-function renderTree(){var info=listDir();var all=info.dirs.length+info.files.length;document.getElementById('fb-path').textContent=bPath;document.getElementById('fb-count').textContent=all+' ITEM'+(all!==1?'S':'');var html='';if(bPath!=='/')html+='<div class="tree-row" data-type="up"><span style="font-size:12px;color:var(--cf-text-muted)">&#8593;</span><span class="tree-name">..</span></div>';info.dirs.forEach(function(d){var dp=(bPath==='/'?'':bPath)+'/'+d;html+='<div class="tree-row" data-type="dir" data-path="'+esc(dp)+'"><span style="font-size:14px">&#128193;</span><span class="tree-name">'+esc(d)+'/</span><button class="tree-del" data-path="'+esc(dp)+'" data-deltype="dir" title="Delete directory">&#215;</button></div>';});info.files.forEach(function(f){var name=f.path.split('/').pop();var sz=f.size<1024?f.size+' B':(f.size<1048576?Math.round(f.size/1024)+' KB':Math.round(f.size/1048576)+' MB');var vu=getViewUrl(f.path);var dt=f.updatedAt?fmtDate(f.updatedAt):'';html+='<div class="tree-row" data-type="file" data-path="'+esc(f.path)+'"><span style="font-size:14px">&#128196;</span><span class="tree-name">'+esc(name)+'</span><span class="tree-size">'+sz+'</span>'+(dt?'<span class="tree-date">'+esc(dt)+'</span>':'')+'<button class="tree-dl" data-path="'+esc(f.path)+'" title="Download">&#8595;</button><a class="tree-url" href="'+esc(vu)+'" target="_blank" rel="noopener" title="Open in browser">&#128279;</a><button class="tree-del" data-path="'+esc(f.path)+'" data-deltype="file" title="Delete">&#215;</button></div>';});if(!html)html='<div class="empty" style="padding:20px">Empty directory</div>';document.getElementById('file-tree').innerHTML=html;}
-document.getElementById('file-tree').addEventListener('click',function(e){if(e.target.closest('.tree-url'))return;var dl=e.target.closest('.tree-dl');if(dl){e.stopPropagation();downloadFile(dl.dataset.path);return;}var del=e.target.closest('.tree-del');if(del){e.stopPropagation();if(del.dataset.deltype==='dir')delDir(del.dataset.path);else delFile(del.dataset.path);return;}var row=e.target.closest('.tree-row');if(!row)return;var type=row.dataset.type;if(type==='up'){var parts=bPath.split('/').filter(Boolean);parts.pop();bPath=parts.length?'/'+parts.join('/'):'/';renderTree();}else if(type==='dir'){bPath=row.dataset.path;renderTree();}else if(type==='file'){viewFile(row.dataset.path);document.querySelectorAll('.tree-row').forEach(function(r){r.classList.remove('selected');});row.classList.add('selected');}});
+function renderTree(){var info=listDir();var all=info.dirs.length+info.files.length;document.getElementById('fb-path').textContent=bPath;document.getElementById('fb-count').textContent=all+' ITEM'+(all!==1?'S':'');var html='';if(bPath!=='/')html+='<div class="tree-row" data-type="up"><span style="font-size:12px;color:var(--cf-text-muted)">&#8593;</span><span class="tree-name">..</span></div>';info.dirs.forEach(function(d){var dp=(bPath==='/'?'':bPath)+'/'+d;html+='<div class="tree-row" data-type="dir" data-path="'+esc(dp)+'"><span style="font-size:14px">&#128193;</span><span class="tree-name">'+esc(d)+'/</span><button class="tree-del" data-path="'+esc(dp)+'" data-deltype="dir" title="Delete directory">&#215;</button></div>';});info.files.forEach(function(f){var name=f.path.split('/').pop();var sz=f.size<1024?f.size+' B':(f.size<1048576?Math.round(f.size/1024)+' KB':Math.round(f.size/1048576)+' MB');var vu=getViewUrl(f.path);var dt=f.updatedAt?fmtDate(f.updatedAt):'';var prot=f.protection?true:false;var lockTitle=prot?('Protected by '+(f.protection.createdBy||'?')+' \u2014 click to manage'):'Click to protect this file with a password';var lockGlyph=prot?'&#128274;':'&#128275;';html+='<div class="tree-row" data-type="file" data-path="'+esc(f.path)+'"><span style="font-size:14px">&#128196;</span><span class="tree-name">'+esc(name)+'</span><span class="tree-size">'+sz+'</span>'+(dt?'<span class="tree-date">'+esc(dt)+'</span>':'')+'<button class="tree-lock'+(prot?' protected':'')+'" data-path="'+esc(f.path)+'" title="'+esc(lockTitle)+'">'+lockGlyph+'</button><button class="tree-dl" data-path="'+esc(f.path)+'" title="Download">&#8595;</button><a class="tree-url" href="'+esc(vu)+'" target="_blank" rel="noopener" title="Open in browser">&#128279;</a><button class="tree-del" data-path="'+esc(f.path)+'" data-deltype="file" title="Delete">&#215;</button></div>';});if(!html)html='<div class="empty" style="padding:20px">Empty directory</div>';document.getElementById('file-tree').innerHTML=html;}
+document.getElementById('file-tree').addEventListener('click',function(e){if(e.target.closest('.tree-url'))return;var lk=e.target.closest('.tree-lock');if(lk){e.stopPropagation();openProtectPanel(lk.dataset.path);return;}var dl=e.target.closest('.tree-dl');if(dl){e.stopPropagation();downloadFile(dl.dataset.path);return;}var del=e.target.closest('.tree-del');if(del){e.stopPropagation();if(del.dataset.deltype==='dir')delDir(del.dataset.path);else delFile(del.dataset.path);return;}var row=e.target.closest('.tree-row');if(!row)return;var type=row.dataset.type;if(type==='up'){var parts=bPath.split('/').filter(Boolean);parts.pop();bPath=parts.length?'/'+parts.join('/'):'/';renderTree();}else if(type==='dir'){bPath=row.dataset.path;renderTree();}else if(type==='file'){viewFile(row.dataset.path);document.querySelectorAll('.tree-row').forEach(function(r){r.classList.remove('selected');});row.classList.add('selected');}});
+
+/* ── Protection panel ── */
+function findFile(path){for(var i=0;i<bFiles.length;i++){if(bFiles[i].path===path)return bFiles[i];}return null;}
+function fmtPanelDate(ts){if(!ts)return'';var d=new Date(ts);return d.toLocaleDateString([],{year:'numeric',month:'short',day:'numeric'})+' '+d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});}
+function openProtectPanel(path){
+  var f=findFile(path);if(!f)return;
+  var bd=document.getElementById('protect-backdrop'),pn=document.getElementById('protect-panel');
+  document.getElementById('protect-file').textContent=path;
+  renderProtectPanel(f);
+  bd.classList.add('open');pn.classList.add('open');
+}
+function closeProtectPanel(){document.getElementById('protect-backdrop').classList.remove('open');document.getElementById('protect-panel').classList.remove('open');}
+function renderProtectPanel(f){
+  var body=document.getElementById('protect-body');
+  var prot=f.protection;
+  var html='';
+  if(prot){
+    var canModify=prot.createdBy===USER_EMAIL||IS_ADMIN||bWs!=='shared';
+    html+='<div class="protect-state"><strong>Protected</strong> by <strong>'+esc(prot.createdBy||'?')+'</strong>'
+        +'<br>Since '+esc(fmtPanelDate(prot.createdAt))
+        +(prot.rotatedAt?'<br>Last rotated '+esc(fmtPanelDate(prot.rotatedAt)):'')+'</div>';
+    if(canModify){
+      html+='<div class="protect-section-label">Rotate password</div>';
+      html+='<div class="pwd-input-wrap"><input id="protect-new-pwd" type="password" placeholder="New password" autocomplete="new-password"><button type="button" class="pwd-eye" data-target="protect-new-pwd" aria-label="Show password">'+EYE_SVG+'</button></div>';
+      html+='<div class="pwd-actions"><button class="sm" id="protect-gen-btn">Generate</button><button class="sm primary" id="protect-rotate-btn">Rotate</button></div>';
+      html+='<div class="protect-divider"></div>';
+      html+='<button class="sm danger" id="protect-remove-btn">Remove protection</button>';
+    }else{
+      html+='<div style="font-size:12px;color:var(--cf-text-muted);font-style:italic">Only the creator (<strong>'+esc(prot.createdBy)+'</strong>) or an admin can modify or remove this protection.</div>';
+    }
+  }else{
+    html+='<div class="protect-state unprotected">This file is <strong>publicly viewable</strong> at <code>/view?...</code>. Setting a password requires recipients to enter it before the file is served.</div>';
+    html+='<div class="protect-section-label">Set password</div>';
+    html+='<div class="pwd-input-wrap"><input id="protect-new-pwd" type="password" placeholder="Choose a password" autocomplete="new-password"><button type="button" class="pwd-eye" data-target="protect-new-pwd" aria-label="Show password">'+EYE_SVG+'</button></div>';
+    html+='<div class="pwd-actions"><button class="sm" id="protect-gen-btn">Generate</button><button class="sm primary" id="protect-set-btn">Protect</button></div>';
+  }
+  html+='<div id="protect-msg"></div>';
+  body.innerHTML=html;
+  // Wire eye toggles
+  body.querySelectorAll('.pwd-eye').forEach(function(b){b.addEventListener('click',function(){togglePwd(b.dataset.target,b);});});
+  var gen=document.getElementById('protect-gen-btn');if(gen)gen.addEventListener('click',generateProtectPwd);
+  var setBtn=document.getElementById('protect-set-btn');if(setBtn)setBtn.addEventListener('click',function(){submitProtect('set');});
+  var rotBtn=document.getElementById('protect-rotate-btn');if(rotBtn)rotBtn.addEventListener('click',function(){submitProtect('rotate');});
+  var rmBtn=document.getElementById('protect-remove-btn');if(rmBtn)rmBtn.addEventListener('click',function(){submitProtect('remove');});
+}
+var EYE_SVG='<svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M.5 8s2.5-5 7.5-5 7.5 5 7.5 5-2.5 5-7.5 5S.5 8 .5 8z"/><circle cx="8" cy="8" r="2.25"/></svg>';
+function togglePwd(id,btn){var el=document.getElementById(id);if(!el)return;el.type=el.type==='password'?'text':'password';btn.setAttribute('aria-label',el.type==='password'?'Show password':'Hide password');}
+async function generateProtectPwd(){var res=await api('/protect/generate');if(!res||!res.ok)return;var data=await res.json();var el=document.getElementById('protect-new-pwd');if(el){el.type='text';el.value=data.password;el.focus();el.select();}}
+async function submitProtect(action){
+  var file=document.getElementById('protect-file').textContent;
+  var pwd='';
+  if(action!=='remove'){
+    var el=document.getElementById('protect-new-pwd');
+    pwd=el?el.value:'';
+    if(!pwd){setProtectMsg('Enter or generate a password first',false);return;}
+  }
+  if(action==='remove'){if(!confirm('Remove password protection from '+file+'?'))return;}
+  var res=await api('/protect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({workspace:bWs,file:file,action:action,password:pwd||undefined})});
+  if(!res){return;}
+  var data=await res.json();
+  if(!res.ok){setProtectMsg(data.error||'Failed',false);return;}
+  // Update local file record + re-render panel + re-render tree
+  var f=findFile(file);
+  if(f){
+    if(action==='remove'){delete f.protection;}
+    else{f.protection={createdAt:data.createdAt,createdBy:data.createdBy,rotatedAt:data.rotatedAt};}
+  }
+  renderTree();
+  if(action==='remove'){
+    setProtectMsg('Protection removed',true);
+    setTimeout(closeProtectPanel,800);
+  }else{
+    setProtectMsg(action==='rotate'?'Password rotated':'File protected',true);
+    if(f)renderProtectPanel(f);
+  }
+  toast(action==='remove'?'Protection removed':action==='rotate'?'Password rotated':'File protected');
+}
+function setProtectMsg(msg,ok){var el=document.getElementById('protect-msg');if(!el)return;el.className=ok?'protect-success':'protect-error';el.textContent=msg;}
+
 function getViewUrl(path){var base=window.location.origin;if(bWs==='shared')return base+'/view?shared=true&file='+encodeURIComponent(path);return base+'/view?user='+encodeURIComponent(bWs)+'&file='+encodeURIComponent(path);}
 function fmtDate(ts){if(!ts)return'';var d=new Date(ts>1e11?ts:ts*1000);var now=new Date();var sameYear=now.getFullYear()===d.getFullYear();var date=d.toLocaleDateString([],sameYear?{month:'short',day:'numeric'}:{month:'short',day:'numeric',year:'numeric'});var time=d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});return date+' '+time;}
 async function downloadFile(path){var res=await api('/files/read?workspace='+encodeURIComponent(bWs)+'&path='+encodeURIComponent(path));if(!res||!res.ok){toast('Download failed',false);return;}var blob=await res.blob();var url=URL.createObjectURL(blob);var a=document.createElement('a');a.href=url;a.download=path.split('/').pop()||'file';document.body.appendChild(a);a.click();setTimeout(function(){URL.revokeObjectURL(url);document.body.removeChild(a);},100);}
@@ -1496,6 +1697,11 @@ async function initTerminal(){
     if(conn)conn.innerHTML='<span style="color:rgba(245,100,60,.8);font-size:13px">Failed to load terminal: '+esc(String(err))+'</span>';
   }
 }
+
+/* ── Protect panel wiring ── */
+document.getElementById('protect-close-btn').addEventListener('click',closeProtectPanel);
+document.getElementById('protect-backdrop').addEventListener('click',closeProtectPanel);
+document.addEventListener('keydown',function(e){if(e.key==='Escape')closeProtectPanel();});
 
 /* ── Init ── */
 window.addEventListener('load',function(){buildNav();showSection(navItems[0].id);});
@@ -1672,6 +1878,250 @@ html,body{height:100%;overflow:hidden;background:#111;font-family:-apple-system,
 
 function escapeHtml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+// ─── /view request handlers ───────────────────────────────────────────────────
+//
+// Split out from the main router so the route block stays readable.
+//   handleViewRequest — GET /view: protection-aware file server
+//   handleViewUnlock  — POST /view/unlock: password verification + cookie issue
+//
+// Both share renderUnlockPage() for the recipient-facing HTML form.
+
+interface ViewParams {
+  workspace: string;   // "shared" or an email address
+  file: string;
+  isShared: boolean;
+}
+
+function parseViewParams(searchParams: URLSearchParams): ViewParams | null {
+  const isShared = searchParams.get("shared") === "true";
+  const file     = searchParams.get("file");
+  if (!file) return null;
+  if (isShared) return { workspace: "shared", file, isShared: true };
+  const email = searchParams.get("user");
+  if (!email) return null;
+  return { workspace: email, file, isShared: false };
+}
+
+async function handleViewRequest(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext,
+): Promise<Response> {
+  const url = new URL(request.url);
+  const params = parseViewParams(url.searchParams);
+  if (!params) {
+    return new Response("Missing ?user=EMAIL or ?shared=true and ?file=PATH", { status: 400 });
+  }
+
+  // Step 1: protection check
+  const protection = await getProtection(env.OAUTH_KV, params.workspace, params.file);
+
+  if (protection) {
+    // Locked? Show the lockout view immediately without checking the cookie —
+    // protects the unlock cookie from being silently considered valid mid-lockout.
+    if (protection.lockedUntil && new Date(protection.lockedUntil).getTime() > Date.now()) {
+      return renderUnlockPage(env, params, { locked: true, lockedUntil: protection.lockedUntil });
+    }
+    const cookieOk = await checkUnlockCookie(request, params.workspace, params.file, env.COOKIE_ENCRYPTION_KEY);
+    if (!cookieOk) {
+      return renderUnlockPage(env, params, {});
+    }
+    // Cookie valid — fall through to serve the file
+  }
+
+  // Step 2: serve the file
+  const workspace: Workspace = params.isShared ? makeSharedWorkspace(env) : makeWorkspace(params.workspace, env);
+  const content = await workspace.readFile(params.file);
+  if (content === null) {
+    // Self-healing: if a protection record points at a deleted file, remove the record.
+    if (protection) {
+      ctx.waitUntil(deleteProtectionUnchecked(env.OAUTH_KV, params.workspace, params.file));
+    }
+    return new Response(`File not found: ${params.file}`, { status: 404 });
+  }
+  const ext = params.file.split(".").pop()?.toLowerCase() ?? "txt";
+  const headers: Record<string, string> = {
+    "Content-Type": CONTENT_TYPES[ext] ?? "text/plain; charset=utf-8",
+  };
+  if (protection) {
+    headers["Cache-Control"] = "private, no-store";
+  }
+  return new Response(content, { headers });
+}
+
+async function handleViewUnlock(
+  request: Request,
+  env: Env,
+  ctx: ExecutionContext,
+): Promise<Response> {
+  const form = await request.formData();
+  const workspace = String(form.get("workspace") ?? "");
+  const file      = String(form.get("file") ?? "");
+  const password  = String(form.get("password") ?? "");
+  const csrf      = String(form.get("csrf") ?? "");
+  const redirect  = String(form.get("redirect") ?? "");
+  const isShared  = String(form.get("isShared") ?? "") === "true";
+
+  if (!workspace || !file || !password) {
+    return new Response("Missing parameters", { status: 400 });
+  }
+
+  // CSRF check — bound to (workspace, file, COOKIE_ENCRYPTION_KEY)
+  const csrfOk = await verifyCsrfToken(csrf, workspace, file, env.COOKIE_ENCRYPTION_KEY);
+  if (!csrfOk) {
+    return new Response("Invalid or expired form token. Reload the page and try again.", { status: 400 });
+  }
+
+  // Validate redirect: must be a same-origin /view URL
+  let redirectUrl: URL;
+  try { redirectUrl = new URL(redirect, request.url); }
+  catch { return new Response("Invalid redirect", { status: 400 }); }
+  const reqOrigin = new URL(request.url).origin;
+  if (redirectUrl.origin !== reqOrigin || redirectUrl.pathname !== "/view") {
+    return new Response("Invalid redirect", { status: 400 });
+  }
+
+  const result = await verifyProtection(env.OAUTH_KV, workspace, file, password);
+
+  if (result === "ok") {
+    const { setCookie } = await buildUnlockCookie(workspace, file, env.COOKIE_ENCRYPTION_KEY);
+    writeLog(env, ctx, "info", "view.unlock.success", {
+      workspace, file,
+      ip: request.headers.get("cf-connecting-ip") ?? "unknown",
+    });
+    return new Response(null, {
+      status: 302,
+      headers: {
+        "Location": redirectUrl.toString(),
+        "Set-Cookie": setCookie,
+      },
+    });
+  }
+
+  // Failure paths — re-render the form
+  const ip = request.headers.get("cf-connecting-ip") ?? "unknown";
+  if (result === "locked") {
+    writeLog(env, ctx, "warn", "view.unlock.fail", { workspace, file, ip, reason: "locked" });
+    const rec = await getProtection(env.OAUTH_KV, workspace, file);
+    return renderUnlockPage(env, { workspace, file, isShared }, { locked: true, lockedUntil: rec?.lockedUntil ?? null });
+  }
+  // "wrong" or "not_found" — opaque error
+  writeLog(env, ctx, "warn", "view.unlock.fail", { workspace, file, ip, reason: result });
+  // Timing equalisation
+  await new Promise(r => setTimeout(r, 250));
+  return renderUnlockPage(env, { workspace, file, isShared }, { error: "Incorrect password" });
+}
+
+async function renderUnlockPage(
+  env: Env,
+  params: ViewParams,
+  opts: { error?: string; locked?: boolean; lockedUntil?: string | null },
+): Promise<Response> {
+  const csrf = await createCsrfToken(params.workspace, params.file, env.COOKIE_ENCRYPTION_KEY);
+  // Reconstruct the original /view URL so the form can redirect back after unlock.
+  const base = env.PUBLIC_URL.replace(/\/$/, "");
+  const redirect = params.isShared
+    ? `${base}/view?shared=true&file=${encodeURIComponent(params.file)}`
+    : `${base}/view?user=${encodeURIComponent(params.workspace)}&file=${encodeURIComponent(params.file)}`;
+
+  const fileName = params.file.split("/").pop() ?? params.file;
+
+  let alert = "";
+  if (opts.locked && opts.lockedUntil) {
+    const remaining = Math.max(0, Math.ceil((new Date(opts.lockedUntil).getTime() - Date.now()) / 60000));
+    alert = `<div class="alert">Too many incorrect attempts. Try again in <strong>${remaining}</strong> minute${remaining === 1 ? "" : "s"}.</div>`;
+  } else if (opts.error) {
+    alert = `<div class="alert">${escapeHtml(opts.error)}</div>`;
+  }
+
+  const formDisabled = opts.locked ? "disabled" : "";
+
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Protected — ${escapeHtml(fileName)}</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA2NiA2NiI+PHJlY3Qgd2lkdGg9IjY2IiBoZWlnaHQ9IjY2IiByeD0iOSIgZmlsbD0iI0ZGNDgwMSIvPjxnIHRyYW5zZm9ybT0idHJhbnNsYXRlKDAsMTgpIiBmaWxsPSJ3aGl0ZSI+PHBhdGggZD0iTTUyLjY4OCAxMy4wMjhjLS4yMiAwLS40MzcuMDA4LS42NTQuMDE1YS4zLjMgMCAwIDAtLjEwMi4wMjQuMzcuMzcgMCAwIDAtLjIzNi4yNTVsLS45MyAzLjI0OWMtLjQwMSAxLjM5Ny0uMjUyIDIuNjg3LjQyMiAzLjYzNC42MTguODc2IDEuNjQ2IDEuMzkgMi44OTQgMS40NWw1LjA0NS4zMDZhLjQ1LjQ1IDAgMCAxIC40MzUuNDEuNS41IDAgMCAxLS4wMjUuMjIzLjY0LjY0IDAgMCAxLS41NDcuNDI2bC01LjI0Mi4zMDZjLTIuODQ4LjEzMi01LjkxMiAyLjQ1Ni02Ljk4NyA1LjI5bC0uMzc4IDFhLjI4LjI4IDAgMCAwIC4yNDguMzgyaDE4LjA1NGEuNDguNDggMCAwIDAgLjQ2NC0uMzVjLjMyLTEuMTUzLjQ4Mi0yLjM0NC40OC0zLjU0IDAtNy4yMi01Ljc5LTEzLjA3Mi0xMi45MzMtMTMuMDcyTTQ0LjgwNyAyOS41NzhsLjMzNC0xLjE3NWMuNDAyLTEuMzk3LjI1My0yLjY4Ny0uNDItMy42MzQtLjYyLS44NzYtMS42NDctMS4zOS0yLjg5Ni0xLjQ1bC0yMy42NjUtLjMwNmEuNDcuNDcgMCAwIDEtLjM3NC0uMTk5LjUuNSAwIDAgMS0uMDUyLS40MzQuNjQuNjQgMCAwIDEgLjU1Mi0uNDI2bDIzLjg4Ni0uMzA2YzIuODM2LS4xMzEgNS45LTIuNDU2IDYuOTc1LTUuMjlsMS4zNjItMy42YS45LjkgMCAwIDAgLjA0LS40NzdDNDguOTk3IDUuMjU5IDQyLjc4OSAwIDM1LjM2NyAwYy02Ljg0MiAwLTEyLjY0NyA0LjQ2Mi0xNC43MyAxMC42NjVhNi45MiA2LjkyIDAgMCAwLTQuOTExLTEuMzc0Yy0zLjI4LjMzLTUuOTIgMy4wMDItNi4yNDYgNi4zMThhNy4yIDcuMiAwIDAgMCAuMTggMi40NzJDNC4zIDE4LjI0MSAwIDIyLjY3OSAwIDI4LjEzM3EwIC43NC4xMDYgMS40NTNhLjQ2LjQ2IDAgMCAwIC40NTcuNDAyaDQzLjcwNGEuNTcuNTcgMCAwIDAgLjU0LS40MTgiLz48L2c+PC9zdmc+">
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{--cf-orange:#FF4801;--cf-text:#521000;--cf-text-muted:rgba(82,16,0,.7);--cf-text-subtle:rgba(82,16,0,.4);--cf-bg:#FFFBF5;--cf-bg-card:#FFFDFB;--cf-bg-hover:#FEF7ED;--cf-border:#EBD5C1;--cf-error:#DC2626}
+html,body{height:100%;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:var(--cf-bg);color:var(--cf-text);line-height:1.5;-webkit-font-smoothing:antialiased}
+body{display:flex;align-items:center;justify-content:center;padding:20px}
+.card{width:100%;max-width:440px;background:var(--cf-bg-card);border:1px solid var(--cf-border);border-radius:8px;padding:32px 28px;box-shadow:0 1px 3px rgba(82,16,0,.04)}
+.hdr{display:flex;align-items:center;gap:12px;margin-bottom:20px}
+.lock-ico{width:32px;height:32px;border-radius:6px;background:rgba(255,72,1,.12);color:var(--cf-orange);display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.title{font-size:18px;font-weight:600;letter-spacing:-.01em}
+.eyebrow{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--cf-text-muted);margin-bottom:2px}
+.file-line{font-family:"SF Mono","Fira Code",monospace;font-size:12px;color:var(--cf-text-subtle);margin-bottom:22px;word-break:break-all;background:rgba(235,213,193,.25);padding:8px 10px;border-radius:4px}
+label{display:block;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:var(--cf-text-muted);margin-bottom:6px}
+.pwd-wrap{position:relative}
+input[type="password"],input[type="text"]{border:1px solid var(--cf-border);background:var(--cf-bg-card);color:var(--cf-text);font-family:inherit;font-size:14px;border-radius:6px;padding:10px 38px 10px 12px;width:100%;outline:none;transition:border-color .15s}
+input[type="password"]:focus,input[type="text"]:focus{border-color:var(--cf-orange)}
+input[disabled]{background:#F7ECDF;cursor:not-allowed}
+.eye{position:absolute;right:8px;top:50%;transform:translateY(-50%);background:none;border:none;cursor:pointer;color:var(--cf-text-subtle);padding:4px;border-radius:4px;display:flex;align-items:center}
+.eye:hover{color:var(--cf-text)}
+button.submit{margin-top:18px;width:100%;background:var(--cf-orange);color:#fff;border:none;border-radius:9999px;padding:11px 20px;font-size:14px;font-weight:500;cursor:pointer;font-family:inherit;transition:opacity .15s}
+button.submit:hover{opacity:.92}
+button.submit:disabled{background:var(--cf-text-subtle);cursor:not-allowed;opacity:.6}
+.alert{background:rgba(220,38,38,.08);border:1px solid rgba(220,38,38,.25);color:var(--cf-error);font-size:13px;padding:9px 12px;border-radius:6px;margin-bottom:16px}
+.alert strong{color:var(--cf-error)}
+.foot{margin-top:18px;font-size:11px;color:var(--cf-text-subtle);text-align:center}
+.foot a{color:var(--cf-text-muted);text-decoration:none}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="hdr">
+    <div class="lock-ico"><svg width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="7" width="10" height="7" rx="1.5"/><path d="M5.5 7V5a2.5 2.5 0 015 0v2"/></svg></div>
+    <div><div class="eyebrow">AI Sandbox &middot; Protected report</div><div class="title">Password required</div></div>
+  </div>
+  <div class="file-line">${escapeHtml(params.file)}</div>
+  ${alert}
+  <form method="POST" action="/view/unlock" autocomplete="off">
+    <input type="hidden" name="workspace" value="${escapeHtml(params.workspace)}">
+    <input type="hidden" name="file"      value="${escapeHtml(params.file)}">
+    <input type="hidden" name="csrf"      value="${escapeHtml(csrf)}">
+    <input type="hidden" name="redirect"  value="${escapeHtml(redirect)}">
+    <input type="hidden" name="isShared"  value="${params.isShared ? "true" : "false"}">
+    <label for="pwd">Enter password</label>
+    <div class="pwd-wrap">
+      <input id="pwd" type="password" name="password" autofocus required ${formDisabled}>
+      <button class="eye" type="button" id="eye-btn" aria-label="Show password" tabindex="-1">
+        <svg id="eye-show" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M.5 8s2.5-5 7.5-5 7.5 5 7.5 5-2.5 5-7.5 5S.5 8 .5 8z"/><circle cx="8" cy="8" r="2.25"/></svg>
+        <svg id="eye-hide" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="display:none"><path d="M.5 8s2.5-5 7.5-5c1.4 0 2.7.3 3.8.9"/><path d="M14.2 6c.8.9 1.3 2 1.3 2s-2.5 5-7.5 5c-.9 0-1.8-.2-2.6-.5"/><line x1="1.5" y1="14.5" x2="14.5" y2="1.5"/></svg>
+      </button>
+    </div>
+    <button class="submit" type="submit" ${formDisabled}>Unlock</button>
+  </form>
+  <div class="foot">Protected by <a href="${escapeHtml(env.PUBLIC_URL.replace(/\/$/, ""))}/dash">AI Sandbox</a></div>
+</div>
+<script>
+(function(){
+  var btn=document.getElementById('eye-btn'),input=document.getElementById('pwd'),show=document.getElementById('eye-show'),hide=document.getElementById('eye-hide');
+  if(!btn||!input)return;
+  btn.addEventListener('click',function(){
+    var hidden=input.type==='password';
+    input.type=hidden?'text':'password';
+    show.style.display=hidden?'none':'';
+    hide.style.display=hidden?'':'none';
+    btn.setAttribute('aria-label',hidden?'Hide password':'Show password');
+    input.focus();
+  });
+})();
+</script>
+</body>
+</html>`;
+
+  // 200 (not 401) so the form is rendered inline by all clients.  Locked state
+  // also returns 200 — the user can return after the lockout expires.
+  return new Response(html, {
+    headers: {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "no-store, private",
+    },
+  });
 }
 
 // ─── Chat API ─────────────────────────────────────────────────────────────────

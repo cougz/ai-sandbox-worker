@@ -29,7 +29,7 @@ The `/dash` terminal provides a full Linux container (Python, Node.js, shell), b
 ## Security
 
 - **JWT verification uses Access JWKS** - currently fetches the JWKS on every callback. Should cache the public key in KV with a reasonable TTL to avoid the extra network round-trip and potential failures.
-- **`/view` is fully public** - anyone with a URL can read any workspace file. Consider adding an optional `token` query parameter for sensitive reports, or gating `/view` behind Access with a bypass for specific file types.
+- ~~**`/view` is fully public** - anyone with a URL can read any workspace file.~~ **Resolved**: per-file opt-in password protection is available via the dashboard Files tab (🔒 icon) and the `protect_file` / `unprotect_file` / `list_protected_files` MCP tools. Unprotected files behave identically to before; protected files render a password prompt and require a 24h cookie scoped to the specific file path. Hashes are PBKDF2-SHA256 (100k iterations) stored in KV.
 - **D1 workspace has no per-user isolation at the SQL level** - a bug or exploit in the shell library could theoretically read another user's files. Consider row-level security or separate D1 databases per user.
 
 ## Workspace persistence

@@ -100,7 +100,12 @@ export function buildBuiltinToolDefs(domainToolNames: string[]): ToolDef[] {
         "Get a shareable browser URL for a file in the sandbox workspace.",
         "Defaults to your personal workspace (state.*). Set shared=true for",
         "the team shared workspace (shared.*).",
-        "URLs are stable, publicly accessible, and not session-bound.",
+        "URLs are stable and not session-bound.",
+        "",
+        "By default the URL is public — anyone with the link can view the file.",
+        "To require a password before the file is served, use `protect_file` AFTER",
+        "generating the URL — the URL itself stays the same; recipients are simply",
+        "prompted for the password.",
       ].join("\n"),
       params: [
         {
@@ -238,6 +243,81 @@ export function buildBuiltinToolDefs(domainToolNames: string[]): ToolDef[] {
       params: [
         { name: "path", type: "string", description: "Source path in the workspace, e.g. '/data/salesforce-response.json'", required: true },
         { name: "shared", type: "boolean", description: "true = read from shared workspace, false = personal workspace (default)", required: false },
+      ],
+    },
+
+    // ── protect_file ───────────────────────────────────────────────────────
+    {
+      name: "protect_file",
+      description: [
+        "Set or rotate a password on a workspace file so the /view URL prompts for the password before serving it.",
+        "",
+        "USE THIS TOOL when the user asks to:",
+        "  • \"protect\", \"lock\", or \"password-protect\" a file",
+        "  • \"make a file secret\" or \"make a file private\"",
+        "  • \"add a password\" or \"set a password\" on a report",
+        "  • \"rotate\" or \"change\" an existing password",
+        "",
+        "Behaviour:",
+        "  • Public /view URLs continue to work for unprotected files (unchanged behaviour).",
+        "  • Protected files render an unlock prompt; recipients enter the password once,",
+        "    then receive a 24h cookie scoped to /view.",
+        "  • Five failed attempts within 10 minutes trigger a 5-minute lockout.",
+        "",
+        "Password handling:",
+        "  • If the user supplies a password, use it as-is.",
+        "  • If the user does NOT supply a password, omit the parameter — the server generates",
+        "    a 4-word diceware password (e.g. \"calm-river-bear-five\") and returns it.",
+        "  • ALWAYS surface the password back to the user in your reply so they can share it",
+        "    with recipients through a separate channel.",
+        "",
+        "Authorization (shared workspace only):",
+        "  • You can only rotate or change a password on a file YOU originally protected.",
+        "  • If the file was protected by someone else, the tool returns a forbidden error.",
+        "",
+        "The /view URL itself does NOT change when protection is added — anyone using the existing",
+        "link will simply be prompted for the password from now on.",
+      ].join("\n"),
+      params: [
+        { name: "file", type: "string", description: "Workspace path, e.g. '/reports/board-deck.html'", required: true },
+        { name: "password", type: "string", description: "Password to set. Omit to have the server generate a diceware password (recommended unless the user supplies one).", required: false },
+        { name: "shared", type: "boolean", description: "true = file lives in the shared workspace, false = personal workspace (default)", required: false },
+      ],
+    },
+
+    // ── unprotect_file ─────────────────────────────────────────────────────
+    {
+      name: "unprotect_file",
+      description: [
+        "Remove the password from a previously-protected file. After this, the /view URL is",
+        "publicly accessible again (same behaviour as before protection was added).",
+        "",
+        "USE THIS TOOL when the user asks to \"remove the password\", \"unprotect\", \"unlock\",",
+        "or \"make a file public again\".",
+        "",
+        "Authorization (shared workspace): you can only remove a password from a file you",
+        "originally protected, unless you are an admin.",
+      ].join("\n"),
+      params: [
+        { name: "file", type: "string", description: "Workspace path of a previously-protected file", required: true },
+        { name: "shared", type: "boolean", description: "true = shared workspace, false = personal workspace (default)", required: false },
+      ],
+    },
+
+    // ── list_protected_files ───────────────────────────────────────────────
+    {
+      name: "list_protected_files",
+      description: [
+        "List all files in the user's workspace(s) that currently have a password set.",
+        "",
+        "Returns metadata only (file path, creator email, creation/rotation timestamps).",
+        "Never returns the password or its hash.",
+        "",
+        "Use this to answer questions like \"which of my files are protected?\" or",
+        "\"show me my locked reports\".",
+      ].join("\n"),
+      params: [
+        { name: "shared", type: "boolean", description: "true = list shared-workspace protections, false = personal workspace (default). Both lists are always returned regardless.", required: false },
       ],
     },
   ];

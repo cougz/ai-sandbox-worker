@@ -53,7 +53,9 @@ Browser (/chat)               OpenCode TUI / MCP client
 │  /mcp           → SandboxAgent DO (MCP protocol)        │
 │  /authorize     → Cloudflare Access OIDC                │
 │  /callback      → Access OIDC callback                  │
-│  /view          → public workspace file server          │
+│  /view          → workspace file server (public + opt-in │
+│                   password prompt per file)             │
+│  /view/unlock   → password verification endpoint        │
 │  /dash          → admin/user dashboard                  │
 └──────────────────────────┬──────────────────────────────┘
                            │
@@ -140,7 +142,7 @@ Then add **Bypass** policies for the paths that must be reachable without a brow
 
 | Path | Reason |
 |---|---|
-| `/view*` | Public report links — intentionally unauthenticated |
+| `/view*` | Public report links — intentionally unauthenticated. Files can be individually password-protected via the dashboard or MCP tools (see "Protected files" below). |
 | `/chat/oauth/*` | MCP OAuth callbacks from the container |
 | `/chat/ai/*` | Workers AI proxy called by the container |
 | `/mcp*` | MCP protocol — has its own OAuth flow |
@@ -379,12 +381,34 @@ Same as `run_code` but bundles npm packages at runtime so the sandbox can `impor
 
 ### `get_url`
 
-Returns a stable, shareable URL for any file in the workspace. The `/view` endpoint is public — no login required.
+Returns a stable, shareable URL for any file in the workspace. The `/view` endpoint is public by default — no login required.
 
 ```
 get_url({ file: "/reports/dashboard.html" })
 → https://your-domain.com/view?user=alice@example.com&file=/reports/dashboard.html
 ```
+
+For sensitive files, add a password via `protect_file` (below). The URL is unchanged; recipients are prompted for the password before the file is served.
+
+### `protect_file` / `unprotect_file` / `list_protected_files`
+
+Opt-in per-file password protection for `/view` URLs.
+
+```
+protect_file({ file: "/reports/board-deck.html" })
+→ {
+    status: "ok",
+    url: "https://your-domain.com/view?user=alice@example.com&file=/reports/board-deck.html",
+    password: "calm-river-bear-five",   // server-generated diceware (or use yours)
+    message: "File ... is now protected. Share the URL and the password through separate channels."
+  }
+```
+
+- The recipient hits the same `/view` URL, sees a Cloudflare-branded password prompt, enters the password, and receives a 24h cookie scoped to that file.
+- Five failed attempts within 10 minutes triggers a 5-minute lockout per file.
+- In the shared workspace, only the creator of the protection (or an admin) can rotate or remove it.
+- The dashboard Files tab has the same controls — a 🔒 icon next to each file opens a slide-out panel for setting, rotating, or removing protection.
+- Passwords are hashed with PBKDF2-SHA256 (100k iterations, per-record salt) and stored in `OAUTH_KV` under the `protect:` prefix. The cleartext password is never stored.
 
 ### `tool_create` / `tool_list` / `tool_delete` / `tool_reload`
 
@@ -436,6 +460,8 @@ User: "Analyse the pipeline data and create a dashboard"
 ```
 
 The link works for anyone without login. The LLM can use any approach — self-contained HTML with inline CSS and Chart.js, or reusable templates stored in the workspace.
+
+If the report contains sensitive data, ask the LLM to **"protect this with a password"** — it will call `protect_file`, generate a 4-word diceware password, and return both the URL and the password back to you to share through separate channels.
 
 ---
 
